@@ -31,7 +31,7 @@ jobs:
           fi
       - name: Validate pyproject.toml version
         run: |
-          TOML_VERSION=$(grep -Po '(?<=^version = ")[^"]+' pyproject.toml)
+          TOML_VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)"/\1/p' pyproject.toml)
           if [[ "$TOML_VERSION" != "${{ steps.vars.outputs.tag }}" ]]; then
             echo "Version mismatch: pyproject.toml has '$TOML_VERSION' but tag is '${{ steps.vars.outputs.tag }}'"
             exit 1
