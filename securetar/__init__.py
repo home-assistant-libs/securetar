@@ -114,8 +114,23 @@ class SecureTarFile:
         bufsize: int = DEFAULT_BUFSIZE,
         fileobj: IO[bytes] | None = None,
         nonce: bytes | None = None,
+        password: str | None = None,
     ) -> None:
-        """Initialize encryption handler."""
+        """Initialize encryption handler.
+
+        Args:
+            name: Path to the tar file
+            mode: File mode ('r' for read, 'w' for write)
+            key: Encryption key (16 bytes for AES-128). Mutually exclusive with password.
+            gzip: Whether to use gzip compression
+            bufsize: Buffer size for I/O operations
+            fileobj: File object to use instead of opening a file
+            nonce: Nonce for encryption (optional)
+            password: Password to derive encryption key from. Mutually exclusive with key.
+        """
+        if key is not None and password is not None:
+            raise ValueError("Cannot specify both 'key' and 'password'")
+
         self._file: IO[bytes] | None = None
         self._mode: str = mode
         self._name: Path | None = name
@@ -123,6 +138,10 @@ class SecureTarFile:
         self._extra_args = {}
         self._fileobj = fileobj
         self._nonce = nonce
+
+        # Derive key from password if provided
+        if password is not None:
+            key = password_to_key(password)
 
         # Tarfile options
         self._tar: tarfile.TarFile | None = None
@@ -148,11 +167,29 @@ class SecureTarFile:
         self.securetar_header: SecureTarHeader | None = None
 
     def create_inner_tar(
-        self, name: str, key: bytes | None = None, gzip: bool = True
+        self,
+        name: str,
+        key: bytes | None = None,
+        gzip: bool = True,
+        password: str | None = None,
     ) -> "_InnerSecureTarFile":
-        """Create inner tar file."""
+        """Create inner tar file.
+
+        Args:
+            name: Name of the inner tar file
+            key: Encryption key (16 bytes for AES-128). Mutually exclusive with password.
+            gzip: Whether to use gzip compression
+            password: Password to derive encryption key from. Mutually exclusive with key.
+        """
+        if key is not None and password is not None:
+            raise ValueError("Cannot specify both 'key' and 'password'")
+
         if not self._tar:
             raise SecureTarError("SecureTar not open")
+
+        # Derive key from password if provided
+        if password is not None:
+            key = password_to_key(password)
 
         return _InnerSecureTarFile(
             self._tar,
@@ -530,6 +567,18 @@ def _add_stream(
         tar.members.append(tar_info)
         # Finally return to the end of the outer tar file
         fileobj.seek(tell_after_writing_inner_tar + padding_size)
+
+
+def password_to_key(password: str) -> bytes:
+    """Generate an AES key from password.
+
+    Uses 100 rounds of SHA256 hashing to derive a 16-byte key from a password.
+    This is used for both backup version 1 and version 2.
+    """
+    key: bytes = password.encode()
+    for _ in range(100):
+        key = hashlib.sha256(key).digest()
+    return key[:16]
 
 
 def _generate_iv(key: bytes, salt: bytes) -> bytes:
