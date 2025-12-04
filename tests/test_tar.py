@@ -180,7 +180,7 @@ def test_create_with_error(
 @pytest.mark.parametrize("bufsize", [333, 10240, 4 * 2**20])
 def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
     """Test to create a tar file with encryption."""
-    key = os.urandom(16)
+    password = "hunter2"
 
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
@@ -193,7 +193,7 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(temp_tar, "w", key=key, bufsize=bufsize) as tar_file:
+    with SecureTarFile(temp_tar, "w", password=password, bufsize=bufsize) as tar_file:
         atomic_contents_add(
             tar_file,
             temp_orig,
@@ -205,7 +205,7 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 
     # Iterate over the tar file
     files = set()
-    with SecureTarFile(temp_tar, "r", key=key, bufsize=bufsize) as tar_file:
+    with SecureTarFile(temp_tar, "r", password=password, bufsize=bufsize) as tar_file:
         for tar_info in tar_file:
             files.add(tar_info.name)
     assert files == {
@@ -220,7 +220,7 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(temp_tar, "r", key=key, bufsize=bufsize) as tar_file:
+    with SecureTarFile(temp_tar, "r", password=password, bufsize=bufsize) as tar_file:
         tar_file.extractall(path=temp_new, members=tar_file)
 
     assert temp_new.is_dir()
@@ -246,7 +246,7 @@ def test_create_encrypted_tar_fixed_nonce(
     tmp_path: Path, nonce: bytes | None, expect_same_content: bool
 ) -> None:
     """Test to create a tar file with pre-defined nonce."""
-    key = os.urandom(16)
+    password = "hunter2"
 
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
@@ -259,7 +259,7 @@ def test_create_encrypted_tar_fixed_nonce(
 
     # Create Tarfile1
     temp_tar1 = tmp_path.joinpath("backup1.tar")
-    with SecureTarFile(temp_tar1, "w", key=key, nonce=nonce) as tar_file:
+    with SecureTarFile(temp_tar1, "w", password=password, nonce=nonce) as tar_file:
         atomic_contents_add(
             tar_file,
             temp_orig,
@@ -269,7 +269,7 @@ def test_create_encrypted_tar_fixed_nonce(
 
     # Create Tarfile2
     temp_tar2 = tmp_path.joinpath("backup2.tar")
-    with SecureTarFile(temp_tar2, "w", key=key, nonce=nonce) as tar_file:
+    with SecureTarFile(temp_tar2, "w", password=password, nonce=nonce) as tar_file:
         atomic_contents_add(
             tar_file,
             temp_orig,
@@ -428,7 +428,7 @@ def test_tar_inside_tar_encrypt(
     assert files == {"backup.json", *inner_tar_files}
 
     # Encrypt the inner tar files
-    key = os.urandom(16)
+    password = "hunter2"
     temp_encrypted = tmp_path.joinpath("encrypted")
     os.makedirs(temp_encrypted, exist_ok=True)
     with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
@@ -438,7 +438,7 @@ def test_tar_inside_tar_encrypt(
             istf = SecureTarFile(
                 None,
                 gzip=False,  # We encrypt the compressed tar
-                key=key,
+                password=password,
                 mode="r",
                 fileobj=tar_file.extractfile(tar_info),
             )
@@ -469,7 +469,7 @@ def test_tar_inside_tar_encrypt(
             istf = SecureTarFile(
                 None,
                 gzip=False,  # We decrypt the compressed tar
-                key=key,
+                password=password,
                 mode="r",
                 fileobj=encrypted_inner_tar,
             )
@@ -579,7 +579,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
 def test_encrypted_tar_inside_tar(
     tmp_path: Path, bufsize: int, enable_gzip: bool, inner_tar_files: tuple[str, ...]
 ) -> None:
-    key = os.urandom(16)
+    password = "hunter2"
 
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
@@ -592,7 +592,7 @@ def test_encrypted_tar_inside_tar(
     with outer_secure_tar_file as outer_tar_file:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_file.create_inner_tar(
-                inner_tar_file, key=key, gzip=enable_gzip
+                inner_tar_file, password=password, gzip=enable_gzip
             ) as inner_tar_file:
                 atomic_contents_add(
                     inner_tar_file,
@@ -622,7 +622,7 @@ def test_encrypted_tar_inside_tar(
             istf = SecureTarFile(
                 None,
                 gzip=False,  # We decrypt the compressed tar
-                key=b"wrong_key_abcdef",
+                password="wrong password",
                 mode="r",
                 fileobj=tar_file.extractfile(tar_info),
             )
@@ -643,7 +643,7 @@ def test_encrypted_tar_inside_tar(
             istf = SecureTarFile(
                 None,
                 gzip=False,  # We decrypt the compressed tar
-                key=key,
+                password=password,
                 mode="r",
                 fileobj=tar_file.extractfile(tar_info),
             )
@@ -691,7 +691,7 @@ def test_encrypted_tar_inside_tar(
         with SecureTarFile(
             temp_new.joinpath(inner_tar_file),
             "r",
-            key=key,
+            password=password,
             gzip=enable_gzip,
             bufsize=bufsize,
         ) as tar_file:
@@ -714,7 +714,7 @@ def test_encrypted_tar_inside_tar(
 def test_encrypted_gzipped_tar_inside_tar_legacy_format(
     tmp_path: Path, bufsize: int
 ) -> None:
-    key = b"0123456789abcdef"
+    password = "not_correct"
 
     fixture_path = Path(__file__).parent.joinpath("fixtures")
     main_tar = fixture_path.joinpath("./backup_encrypted_gzipped_legacy_format.tar")
@@ -735,12 +735,16 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
     # Decrypt the inner tar
     temp_decrypted = tmp_path.joinpath("decrypted")
     os.makedirs(temp_decrypted, exist_ok=True)
-    with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
+    with (
+        # The fixture was created when passing a key directly, so we mock the key
+        patch("securetar._password_to_key", return_value=b"0123456789abcdef"),
+        SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file,
+    ):
         for tar_info in tar_file:
             istf = SecureTarFile(
                 None,
                 gzip=False,  # We decrypt the compressed tar
-                key=key,
+                password=password,
                 mode="r",
                 fileobj=tar_file.extractfile(tar_info),
             )
@@ -797,9 +801,9 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
 def test_inner_tar_not_allowed_in_encrypted(tmp_path: Path) -> None:
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    key = os.urandom(16)
+    password = "hunter2"
 
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", key=key, gzip=False)
+    outer_secure_tar_file = SecureTarFile(main_tar, "w", password=password, gzip=False)
 
     with pytest.raises(tarfile.StreamError):
         with outer_secure_tar_file:
@@ -886,11 +890,12 @@ def test_outer_tar_open_close(tmp_path: Path) -> None:
 def test_outer_tar_exclusive_mode(tmp_path: Path) -> None:
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
+    password = "hunter2"
     outer_secure_tar_file = SecureTarFile(main_tar, "x", gzip=False)
 
     with outer_secure_tar_file:
         with outer_secure_tar_file.create_inner_tar(
-            "any.tgz", key=os.urandom(16), gzip=True
+            "any.tgz", password=password, gzip=True
         ):
             pass
 
