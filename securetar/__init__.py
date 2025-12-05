@@ -112,7 +112,7 @@ class SecureTarFile:
         mode: str = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
-        cipher_context_data: SecureTarCipherContextData | None = None,
+        cipher_context_data: SecureTarDerivedKeyMaterial | None = None,
         fileobj: IO[bytes] | None = None,
         gzip: bool = True,
         password: str | None = None,
@@ -155,7 +155,7 @@ class SecureTarFile:
         if cipher_context_data:
             self._cipher_context_data = cipher_context_data
         elif password:
-            self._cipher_context = SecureTarCipherContext(password)
+            self._cipher_context = SecureTarRootKeyContext(password)
         else:
             self._cipher_context = None
 
@@ -217,14 +217,14 @@ class SecureTarFile:
         if self._mode == MOD_READ:
             self.securetar_header = SecureTarHeader.from_bytes(self._file)
             cipher_mode = CipherMode.DECRYPT
-            cipher_context_data = self._cipher_context.restore_secure_tar_context(
+            cipher_context_data = self._cipher_context.restore_key_material(
                 header=self.securetar_header
             )
         else:
             if self._cipher_context_data:
                 cipher_context_data = self._cipher_context_data
             else:
-                cipher_context_data = self._cipher_context.generate_secure_tar_context(
+                cipher_context_data = self._cipher_context.derive_key_material(
                     tag=None
                 )
             cbc_rand = cipher_context_data.nonce
@@ -258,7 +258,7 @@ class SecureTarFile:
             self._file = os.fdopen(fd, "rb" if read_mode else "wb")
 
     def _setup_cipher(
-        self, cipher_mode: CipherMode, cipher_context_data: SecureTarCipherContextData
+        self, cipher_mode: CipherMode, cipher_context_data: SecureTarDerivedKeyMaterial
     ) -> None:
         # Create Cipher
         key = cipher_context_data.key
@@ -387,7 +387,7 @@ class SecureTarFile:
         try:
             self._open_file()
             self.securetar_header = SecureTarHeader.from_bytes(self._file)
-            cipher_context_data = self._cipher_context.restore_secure_tar_context(
+            cipher_context_data = self._cipher_context.restore_key_material(
                 header=self.securetar_header
             )
             self._setup_cipher(CipherMode.DECRYPT, cipher_context_data)
@@ -423,7 +423,7 @@ class SecureTarFile:
             if self._cipher_context_data:
                 cipher_context_data = self._cipher_context_data
             else:
-                cipher_context_data = self._cipher_context.generate_secure_tar_context(
+                cipher_context_data = self._cipher_context.derive_key_material(
                     tag=None
                 )
             cbc_rand = cipher_context_data.nonce
@@ -507,7 +507,7 @@ class _InnerSecureTarFile(SecureTarFile):
 
 
 @dataclass(frozen=True, kw_only=True)
-class SecureTarCipherContextData:
+class SecureTarDerivedKeyMaterial:
     """Dataclass to hold key and iv for encrypted SecureTar file."""
 
     key: bytes
@@ -515,7 +515,7 @@ class SecureTarCipherContextData:
     nonce: bytes
 
 
-class SecureTarCipherContext:
+class SecureTarRootKeyContext:
     """Handle cipher contexts for multiple inner SecureTar files."""
 
     _key: bytes | None = None
@@ -523,29 +523,29 @@ class SecureTarCipherContext:
     def __init__(self, password: str):
         """Initialize."""
         self._password = password
-        self._inner_tar_cipher_contexts: dict[Hashable, SecureTarCipherContextData] = {}
+        self._inner_tar_cipher_contexts: dict[Hashable, SecureTarDerivedKeyMaterial] = {}
 
-    def generate_secure_tar_context(self, tag: Hashable) -> SecureTarCipherContextData:
-        """Generate cipher context for an encrypted tar file."""
+    def derive_key_material(self, tag: Hashable ) -> SecureTarDerivedKeyMaterial:
+        """Derive per-entry key material from the root key."""
         if not self._key:
             self._key = self._password_to_key(self._password)
         if tag not in self._inner_tar_cipher_contexts:
             cbc_rand = os.urandom(IV_SIZE)
             iv = self._generate_iv(self._key, cbc_rand)
-            self._inner_tar_cipher_contexts[tag] = SecureTarCipherContextData(
+            self._inner_tar_cipher_contexts[tag] = SecureTarDerivedKeyMaterial(
                 key=self._key, iv=iv, nonce=cbc_rand
             )
         return self._inner_tar_cipher_contexts[tag]
 
-    def restore_secure_tar_context(
+    def restore_key_material(
         self, header: SecureTarHeader
-    ) -> SecureTarCipherContextData:
-        """Restore cipher context for an encrypted tar file."""
+    ) -> SecureTarDerivedKeyMaterial:
+        """Reconstruct key material from existing header fields."""
         if not self._key:
             self._key = self._password_to_key(self._password)
         cbc_rand = header.cbc_rand
         iv = self._generate_iv(self._key, cbc_rand)
-        return SecureTarCipherContextData(key=self._key, iv=iv, nonce=cbc_rand)
+        return SecureTarDerivedKeyMaterial(key=self._key, iv=iv, nonce=cbc_rand)
 
     @staticmethod
     def _password_to_key(password: str) -> bytes:

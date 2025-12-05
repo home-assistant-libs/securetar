@@ -16,10 +16,10 @@ import pytest
 from securetar import (
     AddFileError,
     SECURETAR_MAGIC,
-    SecureTarCipherContext,
     SecureTarError,
     SecureTarFile,
     SecureTarReadError,
+    SecureTarRootKeyContext,
     _add_stream,
     atomic_contents_add,
     secure_path,
@@ -262,8 +262,8 @@ def test_create_encrypted_tar_fixed_nonce(
 
     # Create Tarfile1
     if create_cipher_context:
-        cipher_context = SecureTarCipherContext(password)
-        cipher_context_data = cipher_context.generate_secure_tar_context("inner_file")
+        cipher_context = SecureTarRootKeyContext(password)
+        cipher_context_data = cipher_context.derive_key_material("inner_file")
     temp_tar1 = tmp_path.joinpath("backup1.tar")
     with SecureTarFile(
         temp_tar1, "w", cipher_context_data=cipher_context_data
@@ -277,7 +277,7 @@ def test_create_encrypted_tar_fixed_nonce(
 
     # Create Tarfile2
     if create_cipher_context:
-        cipher_context_data = cipher_context.generate_secure_tar_context("inner_file")
+        cipher_context_data = cipher_context.derive_key_material("inner_file")
     temp_tar2 = tmp_path.joinpath("backup2.tar")
     with SecureTarFile(
         temp_tar2, "w", cipher_context_data=cipher_context_data
@@ -750,7 +750,7 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
     with (
         # The fixture was created when passing a key directly, so we mock the key
         patch(
-            "securetar.SecureTarCipherContext._password_to_key",
+            "securetar.SecureTarRootKeyContext._password_to_key",
             return_value=b"0123456789abcdef",
         ),
         SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file,
