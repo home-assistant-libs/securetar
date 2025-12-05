@@ -109,13 +109,25 @@ class SecureTarFile:
         self,
         name: Path | None = None,
         mode: str = "r",
-        key: bytes | None = None,
-        gzip: bool = True,
+        *,
         bufsize: int = DEFAULT_BUFSIZE,
         fileobj: IO[bytes] | None = None,
+        gzip: bool = True,
         nonce: bytes | None = None,
+        password: str | None = None,
     ) -> None:
-        """Initialize encryption handler."""
+        """Initialize encryption handler.
+
+        Args:
+            name: Path to the tar file
+            mode: File mode ('r' for read, 'w' for write)
+            bufsize: Buffer size for I/O operations
+            fileobj: File object to use instead of opening a file
+            gzip: Whether to use gzip compression
+            nonce: Nonce for encryption (optional)
+            password: Password to derive encryption key from.
+        """
+
         self._file: IO[bytes] | None = None
         self._mode: str = mode
         self._name: Path | None = name
@@ -126,7 +138,7 @@ class SecureTarFile:
 
         # Tarfile options
         self._tar: tarfile.TarFile | None = None
-        if key:
+        if password:
             self._tar_mode = f"{mode}|"
         else:
             self._tar_mode = f"{mode}:"
@@ -138,7 +150,7 @@ class SecureTarFile:
 
         # Encryption/Description
         self._aes: Cipher | None = None
-        self._key: bytes | None = key
+        self._password: str | None = password
 
         # Function helper
         self._cipher: CipherContext | None = None
@@ -148,19 +160,29 @@ class SecureTarFile:
         self.securetar_header: SecureTarHeader | None = None
 
     def create_inner_tar(
-        self, name: str, key: bytes | None = None, gzip: bool = True
+        self,
+        name: str,
+        *,
+        gzip: bool = True,
+        password: str | None = None,
     ) -> "_InnerSecureTarFile":
-        """Create inner tar file."""
+        """Create inner tar file.
+
+        Args:
+            name: Name of the inner tar file
+            gzip: Whether to use gzip compression
+            password: Password to derive encryption key from.
+        """
         if not self._tar:
             raise SecureTarError("SecureTar not open")
 
         return _InnerSecureTarFile(
             self._tar,
-            name=Path(name),
-            mode="w",
-            key=key,
-            gzip=gzip,
             bufsize=self._bufsize,
+            gzip=gzip,
+            mode="w",
+            name=Path(name),
+            password=password,
         )
 
     def __enter__(self) -> tarfile.TarFile:
@@ -172,7 +194,7 @@ class SecureTarFile:
 
         Returns tarfile object, data written to is encrypted if key is provided.
         """
-        if not self._key:
+        if not self._password:
             self._tar = tarfile.open(
                 name=str(self._name),
                 mode=self._tar_mode,
@@ -224,9 +246,11 @@ class SecureTarFile:
         cbc_rand = self.securetar_header.cbc_rand
 
         # Create Cipher
+        key = _password_to_key(self._password)
+        iv = _generate_iv(key, cbc_rand)
         self._aes = Cipher(
-            algorithms.AES(self._key),
-            modes.CBC(_generate_iv(self._key, cbc_rand)),
+            algorithms.AES(key),
+            modes.CBC(iv),
             backend=default_backend(),
         )
 
@@ -416,18 +440,19 @@ class _InnerSecureTarFile(SecureTarFile):
         outer_tar: tarfile.TarFile,
         name: Path,
         mode: str,
-        key: bytes | None = None,
-        gzip: bool = True,
-        bufsize: int = DEFAULT_BUFSIZE,
+        *,
+        bufsize: int,
+        gzip: bool,
+        password: bytes | None,
     ) -> None:
         """Initialize inner handler."""
         super().__init__(
             name=name,
             mode=mode,
-            key=key,
             gzip=gzip,
             bufsize=bufsize,
             fileobj=outer_tar.fileobj,
+            password=password,
         )
         self.outer_tar = outer_tar
         self.stream: Generator[BinaryIO, None, None] | None = None
@@ -530,6 +555,17 @@ def _add_stream(
         tar.members.append(tar_info)
         # Finally return to the end of the outer tar file
         fileobj.seek(tell_after_writing_inner_tar + padding_size)
+
+
+def _password_to_key(password: str) -> bytes:
+    """Generate a AES Key from password.
+
+    Uses 100 rounds of SHA256 hashing to derive a 16-byte key from a password.
+    """
+    key: bytes = password.encode()
+    for _ in range(100):
+        key = hashlib.sha256(key).digest()
+    return key[:16]
 
 
 def _generate_iv(key: bytes, salt: bytes) -> bytes:
