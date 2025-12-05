@@ -112,7 +112,7 @@ class SecureTarFile:
         mode: str = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
-        cipher_context_data: SecureTarDerivedKeyMaterial | None = None,
+        derived_key_material: SecureTarDerivedKeyMaterial | None = None,
         fileobj: IO[bytes] | None = None,
         gzip: bool = True,
         password: str | None = None,
@@ -123,7 +123,7 @@ class SecureTarFile:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write)
             bufsize: Buffer size for I/O operations
-            cipher_context_data: Optional cipher context for multiple inner SecureTar files
+            derived_key_material: Optional derived key material for encryption
             fileobj: File object to use instead of opening a file
             gzip: Whether to use gzip compression
             password: Password to derive encryption key from.
@@ -150,14 +150,14 @@ class SecureTarFile:
 
         # Encryption/Decryption
         self._aes: Cipher | None = None
-        self._cipher_context = None
-        self._cipher_context_data = None
-        if cipher_context_data:
-            self._cipher_context_data = cipher_context_data
+        self._root_key_context = None
+        self._derived_key_material = None
+        if derived_key_material:
+            self._derived_key_material = derived_key_material
         elif password:
-            self._cipher_context = SecureTarRootKeyContext(password)
+            self._root_key_context = SecureTarRootKeyContext(password)
         else:
-            self._cipher_context = None
+            self._root_key_context = None
 
         # Function helper
         self._cipher: CipherContext | None = None
@@ -201,7 +201,7 @@ class SecureTarFile:
 
         Returns tarfile object, data written to is encrypted if key is provided.
         """
-        if not self._cipher_context and not self._cipher_context_data:
+        if not self._root_key_context and not self._derived_key_material:
             self._tar = tarfile.open(
                 name=str(self._name),
                 mode=self._tar_mode,
@@ -217,21 +217,21 @@ class SecureTarFile:
         if self._mode == MOD_READ:
             self.securetar_header = SecureTarHeader.from_bytes(self._file)
             cipher_mode = CipherMode.DECRYPT
-            cipher_context_data = self._cipher_context.restore_key_material(
+            derived_key_material = self._root_key_context.restore_key_material(
                 header=self.securetar_header
             )
         else:
-            if self._cipher_context_data:
-                cipher_context_data = self._cipher_context_data
+            if self._derived_key_material:
+                derived_key_material = self._derived_key_material
             else:
-                cipher_context_data = self._cipher_context.derive_key_material(
+                derived_key_material = self._root_key_context.derive_key_material(
                     tag=None
                 )
-            cbc_rand = cipher_context_data.nonce
+            cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, 0)
             self._file.write(self.securetar_header.to_bytes())
             cipher_mode = CipherMode.ENCRYPT
-        self._setup_cipher(cipher_mode, cipher_context_data)
+        self._setup_cipher(cipher_mode, derived_key_material)
 
         self._tar = tarfile.open(
             fileobj=self,
@@ -258,11 +258,11 @@ class SecureTarFile:
             self._file = os.fdopen(fd, "rb" if read_mode else "wb")
 
     def _setup_cipher(
-        self, cipher_mode: CipherMode, cipher_context_data: SecureTarDerivedKeyMaterial
+        self, cipher_mode: CipherMode, derived_key_material: SecureTarDerivedKeyMaterial
     ) -> None:
         # Create Cipher
-        key = cipher_context_data.key
-        iv = cipher_context_data.iv
+        key = derived_key_material.key
+        iv = derived_key_material.iv
         self._aes = Cipher(
             algorithms.AES(key),
             modes.CBC(iv),
@@ -387,10 +387,10 @@ class SecureTarFile:
         try:
             self._open_file()
             self.securetar_header = SecureTarHeader.from_bytes(self._file)
-            cipher_context_data = self._cipher_context.restore_key_material(
+            derived_key_material = self._root_key_context.restore_key_material(
                 header=self.securetar_header
             )
-            self._setup_cipher(CipherMode.DECRYPT, cipher_context_data)
+            self._setup_cipher(CipherMode.DECRYPT, derived_key_material)
             yield DecryptInnerTar(self)
         finally:
             self._close_file()
@@ -420,15 +420,15 @@ class SecureTarFile:
 
         try:
             self._open_file()
-            if self._cipher_context_data:
-                cipher_context_data = self._cipher_context_data
+            if self._derived_key_material:
+                derived_key_material = self._derived_key_material
             else:
-                cipher_context_data = self._cipher_context.derive_key_material(
+                derived_key_material = self._root_key_context.derive_key_material(
                     tag=None
                 )
-            cbc_rand = cipher_context_data.nonce
+            cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, tarinfo.size)
-            self._setup_cipher(CipherMode.ENCRYPT, cipher_context_data)
+            self._setup_cipher(CipherMode.ENCRYPT, derived_key_material)
             yield EncryptInnerTar(self)
         finally:
             self._close_file()
