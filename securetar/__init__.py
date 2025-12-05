@@ -224,9 +224,7 @@ class SecureTarFile:
             if self._derived_key_material:
                 derived_key_material = self._derived_key_material
             else:
-                derived_key_material = self._root_key_context.derive_key_material(
-                    tag=None
-                )
+                derived_key_material = self._root_key_context.derive_key_material()
             cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, 0)
             self._file.write(self.securetar_header.to_bytes())
@@ -423,9 +421,7 @@ class SecureTarFile:
             if self._derived_key_material:
                 derived_key_material = self._derived_key_material
             else:
-                derived_key_material = self._root_key_context.derive_key_material(
-                    tag=None
-                )
+                derived_key_material = self._root_key_context.derive_key_material()
             cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, tarinfo.size)
             self._setup_cipher(CipherMode.ENCRYPT, derived_key_material)
@@ -525,17 +521,23 @@ class SecureTarRootKeyContext:
         self._password = password
         self._derived_keys: dict[Hashable, SecureTarDerivedKeyMaterial] = {}
 
-    def derive_key_material(self, tag: Hashable) -> SecureTarDerivedKeyMaterial:
+    def derive_key_material(
+        self, key_id: Hashable | None = None
+    ) -> SecureTarDerivedKeyMaterial:
         """Derive per-entry key material from the root key."""
         if not self._key:
             self._key = self._password_to_key(self._password)
-        if tag not in self._derived_keys:
-            cbc_rand = os.urandom(IV_SIZE)
-            iv = self._generate_iv(self._key, cbc_rand)
-            self._derived_keys[tag] = SecureTarDerivedKeyMaterial(
-                key=self._key, iv=iv, nonce=cbc_rand
-            )
-        return self._derived_keys[tag]
+        if key_id is None:
+            return self._derive_key_material()
+        if key_id not in self._derived_keys:
+            self._derived_keys[key_id] = self._derive_key_material()
+        return self._derived_keys[key_id]
+
+    def _derive_key_material(self) -> SecureTarDerivedKeyMaterial:
+        """Derive per-entry key material from the root key."""
+        cbc_rand = os.urandom(IV_SIZE)
+        iv = self._generate_iv(self._key, cbc_rand)
+        return SecureTarDerivedKeyMaterial(key=self._key, iv=iv, nonce=cbc_rand)
 
     def restore_key_material(
         self, header: SecureTarHeader
