@@ -121,9 +121,9 @@ class SecureTarFile:
         Args:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write)
-            gzip: Whether to use gzip compression
             bufsize: Buffer size for I/O operations
             fileobj: File object to use instead of opening a file
+            gzip: Whether to use gzip compression
             nonce: Nonce for encryption (optional)
             password: Password to derive encryption key from.
         """
