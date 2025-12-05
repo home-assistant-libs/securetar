@@ -258,15 +258,19 @@ def test_create_encrypted_tar_fixed_nonce(
     with open(temp_orig / "randbytes2", "wb") as file:
         file.write(os.urandom(12345))
 
-    derived_key_material = None
+    derived_key_id = None
+    root_key_context = None
 
     # Create Tarfile1
     if create_cipher_context:
+        derived_key_id = "inner_file"
         root_key_context = SecureTarRootKeyContext(password)
-        derived_key_material = root_key_context.derive_key_material("inner_file")
     temp_tar1 = tmp_path.joinpath("backup1.tar")
     with SecureTarFile(
-        temp_tar1, "w", derived_key_material=derived_key_material
+        temp_tar1,
+        "w",
+        derived_key_id=derived_key_id,
+        root_key_context=root_key_context,
     ) as tar_file:
         atomic_contents_add(
             tar_file,
@@ -276,11 +280,12 @@ def test_create_encrypted_tar_fixed_nonce(
         )
 
     # Create Tarfile2
-    if create_cipher_context:
-        derived_key_material = root_key_context.derive_key_material("inner_file")
     temp_tar2 = tmp_path.joinpath("backup2.tar")
     with SecureTarFile(
-        temp_tar2, "w", derived_key_material=derived_key_material
+        temp_tar2,
+        "w",
+        derived_key_id=derived_key_id,
+        root_key_context=root_key_context,
     ) as tar_file:
         atomic_contents_add(
             tar_file,

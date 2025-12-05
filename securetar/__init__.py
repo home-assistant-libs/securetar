@@ -112,10 +112,11 @@ class SecureTarFile:
         mode: str = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
-        derived_key_material: SecureTarDerivedKeyMaterial | None = None,
+        derived_key_id: Hashable | None = None,
         fileobj: IO[bytes] | None = None,
         gzip: bool = True,
         password: str | None = None,
+        root_key_context: SecureTarRootKeyContext | None = None,
     ) -> None:
         """Initialize encryption handler.
 
@@ -123,11 +124,20 @@ class SecureTarFile:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write)
             bufsize: Buffer size for I/O operations
-            derived_key_material: Optional derived key material for encryption
+            derived_key_id: Optional derived key ID for deriving key material. Mutually
+            exclusive with password.
             fileobj: File object to use instead of opening a file
             gzip: Whether to use gzip compression
-            password: Password to derive encryption key from.
+            password: Password to derive encryption key from. Mutually exclusive with
+            root_key_context and derived_key_id.
+            root_key_context: Root key context to use for deriving key material. Mutually
+            exclusive with password.
         """
+
+        if (derived_key_id is not None or root_key_context is not None) and password is not None:
+            raise ValueError("Cannot specify both 'derived_key_id' and 'password'")
+        if derived_key_id is not None and root_key_context is None:
+            raise ValueError("Cannot specify 'derived_key_id' without 'root_key_context'")
 
         self._file: IO[bytes] | None = None
         self._mode: str = mode
@@ -150,14 +160,11 @@ class SecureTarFile:
 
         # Encryption/Decryption
         self._aes: Cipher | None = None
-        self._root_key_context = None
-        self._derived_key_material = None
-        if derived_key_material:
-            self._derived_key_material = derived_key_material
-        elif password:
+        self._derived_key_id = derived_key_id
+        if password:
             self._root_key_context = SecureTarRootKeyContext(password)
         else:
-            self._root_key_context = None
+            self._root_key_context = root_key_context
 
         # Function helper
         self._cipher: CipherContext | None = None
@@ -201,7 +208,7 @@ class SecureTarFile:
 
         Returns tarfile object, data written to is encrypted if key is provided.
         """
-        if not self._root_key_context and not self._derived_key_material:
+        if not self._root_key_context:
             self._tar = tarfile.open(
                 name=str(self._name),
                 mode=self._tar_mode,
@@ -221,10 +228,9 @@ class SecureTarFile:
                 header=self.securetar_header
             )
         else:
-            if self._derived_key_material:
-                derived_key_material = self._derived_key_material
-            else:
-                derived_key_material = self._root_key_context.derive_key_material()
+            derived_key_material = self._root_key_context.derive_key_material(
+                self._derived_key_id
+            )
             cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, 0)
             self._file.write(self.securetar_header.to_bytes())
@@ -418,10 +424,9 @@ class SecureTarFile:
 
         try:
             self._open_file()
-            if self._derived_key_material:
-                derived_key_material = self._derived_key_material
-            else:
-                derived_key_material = self._root_key_context.derive_key_material()
+            derived_key_material = self._root_key_context.derive_key_material(
+                self._derived_key_id
+            )
             cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, tarinfo.size)
             self._setup_cipher(CipherMode.ENCRYPT, derived_key_material)
