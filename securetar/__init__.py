@@ -523,19 +523,19 @@ class SecureTarRootKeyContext:
     def __init__(self, password: str):
         """Initialize."""
         self._password = password
-        self._inner_tar_cipher_contexts: dict[Hashable, SecureTarDerivedKeyMaterial] = {}
+        self._derived_keys: dict[Hashable, SecureTarDerivedKeyMaterial] = {}
 
-    def derive_key_material(self, tag: Hashable ) -> SecureTarDerivedKeyMaterial:
+    def derive_key_material(self, tag: Hashable) -> SecureTarDerivedKeyMaterial:
         """Derive per-entry key material from the root key."""
         if not self._key:
             self._key = self._password_to_key(self._password)
-        if tag not in self._inner_tar_cipher_contexts:
+        if tag not in self._derived_keys:
             cbc_rand = os.urandom(IV_SIZE)
             iv = self._generate_iv(self._key, cbc_rand)
-            self._inner_tar_cipher_contexts[tag] = SecureTarDerivedKeyMaterial(
+            self._derived_keys[tag] = SecureTarDerivedKeyMaterial(
                 key=self._key, iv=iv, nonce=cbc_rand
             )
-        return self._inner_tar_cipher_contexts[tag]
+        return self._derived_keys[tag]
 
     def restore_key_material(
         self, header: SecureTarHeader
