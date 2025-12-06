@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Hashable
+from dataclasses import dataclass
 import enum
 import hashlib
 import logging
@@ -111,10 +112,11 @@ class SecureTarFile:
         mode: str = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
+        derived_key_id: Hashable | None = None,
         fileobj: IO[bytes] | None = None,
         gzip: bool = True,
-        nonce: bytes | None = None,
         password: str | None = None,
+        root_key_context: SecureTarRootKeyContext | None = None,
     ) -> None:
         """Initialize encryption handler.
 
@@ -122,11 +124,24 @@ class SecureTarFile:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write)
             bufsize: Buffer size for I/O operations
+            derived_key_id: Optional derived key ID for deriving key material. Mutually
+            exclusive with password.
             fileobj: File object to use instead of opening a file
             gzip: Whether to use gzip compression
-            nonce: Nonce for encryption (optional)
-            password: Password to derive encryption key from.
+            password: Password to derive encryption key from. Mutually exclusive with
+            root_key_context and derived_key_id.
+            root_key_context: Root key context to use for deriving key material. Mutually
+            exclusive with password.
         """
+
+        if (
+            derived_key_id is not None or root_key_context is not None
+        ) and password is not None:
+            raise ValueError("Cannot specify both 'derived_key_id' and 'password'")
+        if derived_key_id is not None and root_key_context is None:
+            raise ValueError(
+                "Cannot specify 'derived_key_id' without 'root_key_context'"
+            )
 
         self._file: IO[bytes] | None = None
         self._mode: str = mode
@@ -134,7 +149,6 @@ class SecureTarFile:
         self._bufsize: int = bufsize
         self._extra_args = {}
         self._fileobj = fileobj
-        self._nonce = nonce
 
         # Tarfile options
         self._tar: tarfile.TarFile | None = None
@@ -148,9 +162,13 @@ class SecureTarFile:
         if gzip:
             self._tar_mode = self._tar_mode + "gz"
 
-        # Encryption/Description
+        # Encryption/Decryption
         self._aes: Cipher | None = None
-        self._password: str | None = password
+        self._derived_key_id = derived_key_id
+        if password:
+            self._root_key_context = SecureTarRootKeyContext(password)
+        else:
+            self._root_key_context = root_key_context
 
         # Function helper
         self._cipher: CipherContext | None = None
@@ -194,7 +212,7 @@ class SecureTarFile:
 
         Returns tarfile object, data written to is encrypted if key is provided.
         """
-        if not self._password:
+        if not self._root_key_context:
             self._tar = tarfile.open(
                 name=str(self._name),
                 mode=self._tar_mode,
@@ -210,12 +228,18 @@ class SecureTarFile:
         if self._mode == MOD_READ:
             self.securetar_header = SecureTarHeader.from_bytes(self._file)
             cipher_mode = CipherMode.DECRYPT
+            derived_key_material = self._root_key_context.restore_key_material(
+                header=self.securetar_header
+            )
         else:
-            cbc_rand = self._nonce if self._nonce is not None else os.urandom(IV_SIZE)
+            derived_key_material = self._root_key_context.derive_key_material(
+                self._derived_key_id
+            )
+            cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, 0)
             self._file.write(self.securetar_header.to_bytes())
             cipher_mode = CipherMode.ENCRYPT
-        self._setup_cipher(cipher_mode)
+        self._setup_cipher(cipher_mode, derived_key_material)
 
         self._tar = tarfile.open(
             fileobj=self,
@@ -241,13 +265,12 @@ class SecureTarFile:
             fd = os.open(self._name, file_mode, 0o666)
             self._file = os.fdopen(fd, "rb" if read_mode else "wb")
 
-    def _setup_cipher(self, cipher_mode: CipherMode) -> None:
-        # Extract IV for CBC
-        cbc_rand = self.securetar_header.cbc_rand
-
+    def _setup_cipher(
+        self, cipher_mode: CipherMode, derived_key_material: SecureTarDerivedKeyMaterial
+    ) -> None:
         # Create Cipher
-        key = _password_to_key(self._password)
-        iv = _generate_iv(key, cbc_rand)
+        key = derived_key_material.key
+        iv = derived_key_material.iv
         self._aes = Cipher(
             algorithms.AES(key),
             modes.CBC(iv),
@@ -372,7 +395,10 @@ class SecureTarFile:
         try:
             self._open_file()
             self.securetar_header = SecureTarHeader.from_bytes(self._file)
-            self._setup_cipher(CipherMode.DECRYPT)
+            derived_key_material = self._root_key_context.restore_key_material(
+                header=self.securetar_header
+            )
+            self._setup_cipher(CipherMode.DECRYPT, derived_key_material)
             yield DecryptInnerTar(self)
         finally:
             self._close_file()
@@ -402,9 +428,12 @@ class SecureTarFile:
 
         try:
             self._open_file()
-            cbc_rand = self._nonce if self._nonce is not None else os.urandom(IV_SIZE)
+            derived_key_material = self._root_key_context.derive_key_material(
+                self._derived_key_id
+            )
+            cbc_rand = derived_key_material.nonce
             self.securetar_header = SecureTarHeader(cbc_rand, tarinfo.size)
-            self._setup_cipher(CipherMode.ENCRYPT)
+            self._setup_cipher(CipherMode.ENCRYPT, derived_key_material)
             yield EncryptInnerTar(self)
         finally:
             self._close_file()
@@ -482,6 +511,73 @@ class _InnerSecureTarFile(SecureTarFile):
         self.stream.__exit__(exc_type, exc_value, traceback)
 
 
+@dataclass(frozen=True, kw_only=True)
+class SecureTarDerivedKeyMaterial:
+    """Dataclass to hold key and iv for encrypted SecureTar file."""
+
+    key: bytes
+    iv: bytes
+    nonce: bytes
+
+
+class SecureTarRootKeyContext:
+    """Handle cipher contexts for multiple inner SecureTar files."""
+
+    _key: bytes | None = None
+
+    def __init__(self, password: str):
+        """Initialize."""
+        self._password = password
+        self._derived_keys: dict[Hashable, SecureTarDerivedKeyMaterial] = {}
+
+    def derive_key_material(
+        self, key_id: Hashable | None = None
+    ) -> SecureTarDerivedKeyMaterial:
+        """Derive per-entry key material from the root key."""
+        if not self._key:
+            self._key = self._password_to_key(self._password)
+        if key_id is None:
+            return self._derive_key_material()
+        if key_id not in self._derived_keys:
+            self._derived_keys[key_id] = self._derive_key_material()
+        return self._derived_keys[key_id]
+
+    def _derive_key_material(self) -> SecureTarDerivedKeyMaterial:
+        """Derive per-entry key material from the root key."""
+        cbc_rand = os.urandom(IV_SIZE)
+        iv = self._generate_iv(self._key, cbc_rand)
+        return SecureTarDerivedKeyMaterial(key=self._key, iv=iv, nonce=cbc_rand)
+
+    def restore_key_material(
+        self, header: SecureTarHeader
+    ) -> SecureTarDerivedKeyMaterial:
+        """Reconstruct key material from existing header fields."""
+        if not self._key:
+            self._key = self._password_to_key(self._password)
+        cbc_rand = header.cbc_rand
+        iv = self._generate_iv(self._key, cbc_rand)
+        return SecureTarDerivedKeyMaterial(key=self._key, iv=iv, nonce=cbc_rand)
+
+    @staticmethod
+    def _password_to_key(password: str) -> bytes:
+        """Generate a AES Key from password.
+
+        Uses 100 rounds of SHA256 hashing to derive a 16-byte key from a password.
+        """
+        key: bytes = password.encode()
+        for _ in range(100):
+            key = hashlib.sha256(key).digest()
+        return key[:16]
+
+    @staticmethod
+    def _generate_iv(key: bytes, salt: bytes) -> bytes:
+        """Generate an iv from data."""
+        temp_iv = key + salt
+        for _ in range(100):
+            temp_iv = hashlib.sha256(temp_iv).digest()
+        return temp_iv[:IV_SIZE]
+
+
 @contextmanager
 def _add_stream(
     tar: tarfile.TarFile, tar_info: tarfile.TarInfo, inner_tar: _InnerSecureTarFile
@@ -555,25 +651,6 @@ def _add_stream(
         tar.members.append(tar_info)
         # Finally return to the end of the outer tar file
         fileobj.seek(tell_after_writing_inner_tar + padding_size)
-
-
-def _password_to_key(password: str) -> bytes:
-    """Generate a AES Key from password.
-
-    Uses 100 rounds of SHA256 hashing to derive a 16-byte key from a password.
-    """
-    key: bytes = password.encode()
-    for _ in range(100):
-        key = hashlib.sha256(key).digest()
-    return key[:16]
-
-
-def _generate_iv(key: bytes, salt: bytes) -> bytes:
-    """Generate an iv from data."""
-    temp_iv = key + salt
-    for _ in range(100):
-        temp_iv = hashlib.sha256(temp_iv).digest()
-    return temp_iv[:IV_SIZE]
 
 
 def secure_path(tar: tarfile.TarFile) -> Generator[tarfile.TarInfo, None, None]:
