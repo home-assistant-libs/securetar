@@ -446,7 +446,8 @@ class SecureTarFile:
         # Determine if encrypted
         self._encrypted = password is not None or root_key_context is not None
 
-        # Tar mode: streaming (|) for encrypted, normal (:) for plain
+        # Determine the mode for tarfile.open(), streaming (|) for encrypted because
+        # we can't seek in the ciphertext, normal (:) for plain
         if self._encrypted:
             self._tar_mode = f"{mode}|"
         else:
