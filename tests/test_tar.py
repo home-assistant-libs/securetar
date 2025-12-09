@@ -16,11 +16,12 @@ import pytest
 from securetar import (
     AddFileError,
     SECURETAR_MAGIC,
+    SecureTarDecryptingStream,
+    SecureTarEncryptingStream,
     SecureTarError,
     SecureTarFile,
     SecureTarReadError,
     SecureTarRootKeyContext,
-    _add_stream,
     atomic_contents_add,
     secure_path,
 )
@@ -451,17 +452,13 @@ def test_tar_inside_tar_encrypt(
     with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
         for inner_tar_file in inner_tar_files:
             tar_info = tar_file.getmember(inner_tar_file)
-
-            istf = SecureTarFile(
-                None,
-                gzip=False,  # We encrypt the compressed tar
-                password=password,
-                mode="r",
-                fileobj=tar_file.extractfile(tar_info),
-            )
             inner_tar_path = temp_encrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with istf.encrypt(tar_info) as encrypted:
+                with SecureTarEncryptingStream(
+                    tar_file.extractfile(tar_info),
+                    password,
+                    plaintext_size=tar_info.size,
+                ) as encrypted:
                     read = 0
                     while data := encrypted.read(bufsize):
                         read += len(data)
@@ -483,16 +480,11 @@ def test_tar_inside_tar_encrypt(
             tar_info = tarfile.TarInfo(inner_tar_file)
             tar_info.size = encrypted_inner_tar_path.stat().st_size
         with open(encrypted_inner_tar_path, "rb") as encrypted_inner_tar:
-            istf = SecureTarFile(
-                None,
-                gzip=False,  # We decrypt the compressed tar
-                password=password,
-                mode="r",
-                fileobj=encrypted_inner_tar,
-            )
             decrypted_inner_tar_path = temp_decrypted.joinpath(inner_tar_file)
             with open(decrypted_inner_tar_path, "wb") as file:
-                with istf.decrypt(tar_info) as decrypted:
+                with SecureTarDecryptingStream(
+                    encrypted_inner_tar, password, ciphertext_size=tar_info.size
+                ) as decrypted:
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
@@ -636,16 +628,13 @@ def test_encrypted_tar_inside_tar(
     os.makedirs(temp_decrypted, exist_ok=True)
     with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
         for tar_info in tar_file:
-            istf = SecureTarFile(
-                None,
-                gzip=False,  # We decrypt the compressed tar
-                password="wrong password",
-                mode="r",
-                fileobj=tar_file.extractfile(tar_info),
-            )
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with istf.decrypt(tar_info) as decrypted:
+                with SecureTarDecryptingStream(
+                    tar_file.extractfile(tar_info),
+                    "wrong password",
+                    ciphertext_size=tar_info.size,
+                ) as decrypted:
                     with pytest.raises(
                         SecureTarReadError, match="The inner tar is not gzip or tar"
                     ):
@@ -657,16 +646,13 @@ def test_encrypted_tar_inside_tar(
     os.makedirs(temp_decrypted, exist_ok=True)
     with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
         for tar_info in tar_file:
-            istf = SecureTarFile(
-                None,
-                gzip=False,  # We decrypt the compressed tar
-                password=password,
-                mode="r",
-                fileobj=tar_file.extractfile(tar_info),
-            )
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with istf.decrypt(tar_info) as decrypted:
+                with SecureTarDecryptingStream(
+                    tar_file.extractfile(tar_info),
+                    password,
+                    ciphertext_size=tar_info.size,
+                ) as decrypted:
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
@@ -761,16 +747,13 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
         SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file,
     ):
         for tar_info in tar_file:
-            istf = SecureTarFile(
-                None,
-                gzip=False,  # We decrypt the compressed tar
-                password=password,
-                mode="r",
-                fileobj=tar_file.extractfile(tar_info),
-            )
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with istf.decrypt(tar_info) as decrypted:
+                with SecureTarDecryptingStream(
+                    tar_file.extractfile(tar_info),
+                    password,
+                    ciphertext_size=tar_info.size,
+                ) as decrypted:
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
@@ -840,31 +823,6 @@ def test_outer_tar_must_not_be_compressed(tmp_path: Path) -> None:
         with outer_secure_tar_file:
             with outer_secure_tar_file.create_inner_tar("any.tgz", gzip=True):
                 pass
-
-
-@pytest.mark.parametrize(
-    "format", [tarfile.PAX_FORMAT, tarfile.GNU_FORMAT, tarfile.USTAR_FORMAT]
-)
-def test_tar_stream(tmp_path: Path, format: int) -> None:
-    # Create Tarfile
-    main_tar = tmp_path.joinpath("backup.tar")
-
-    with patch.object(tarfile, "DEFAULT_FORMAT", format):
-        ostf = SecureTarFile(main_tar, "w", gzip=False)
-        with ostf as tar_file:
-            tar_info = tarfile.TarInfo(name="test.txt")
-            with _add_stream(tar_file, tar_info, ostf) as stream:
-                stream.write(b"test")
-
-        # Restore
-        temp_new = tmp_path.joinpath("new")
-        with SecureTarFile(main_tar, "r", gzip=False) as tar_file:
-            tar_file.extractall(path=temp_new)
-
-        assert temp_new.is_dir()
-        test_file = temp_new.joinpath("test.txt")
-        assert test_file.is_file()
-        assert test_file.read_bytes() == b"test"
 
 
 def test_outer_tar_must_be_open(tmp_path: Path) -> None:
