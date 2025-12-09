@@ -36,6 +36,8 @@ GZIP_MAGIC_BYTES = b"\x1f\x8b\x08"
 TAR_MAGIC_BYTES = b"ustar"
 TAR_MAGIC_OFFSET = 257
 
+TAR_BLOCK_SIZE = 512
+
 MOD_EXCLUSIVE = "x"
 MOD_READ = "r"
 MOD_WRITE = "w"
@@ -171,6 +173,10 @@ class _SecureTarCipher:
 
     def finalize_header(self, ciphertext_size: int) -> None:
         """Update header with plaintext size based on final ciphertext size."""
+        # The size of the plaintext is the size of the ciphertext size minus:
+        # - The size of the SecureTar header if present (secure tar version 2+)
+        # - The size of the IV
+        # - The size of the padding added (1..16 bytes)
         if self._cipher_mode == CipherMode.ENCRYPT and self.padding_length:
             self.securetar_header.plaintext_size = (
                 ciphertext_size - self.padding_length - IV_SIZE - SECURETAR_HEADER_SIZE
@@ -198,9 +204,14 @@ class _SecureTarCipher:
 class _CipheringReader:
     """Base class to decrypt or encrypt a stream."""
 
-    def __init__(self, source: _SecureTarCipher, size: int) -> None:
+    def __init__(
+        self,
+        source: _SecureTarCipher,
+        size: int,
+        header: bytes | None = None,
+    ) -> None:
         """Initialize."""
-        self._head: bytes | None = None
+        self._head = header
         self._source = source
         self._pos = 0
         self._size = size
@@ -258,7 +269,7 @@ class _DecryptingReader(_CipheringReader):
         """Read data."""
         if self._head is None:
             # Read and validate header
-            self._head = self._source.read(max(size, 512))
+            self._head = self._source.read(max(size, TAR_BLOCK_SIZE))
             self._validate_inner_tar(self._head)
 
         return super().read(size)
@@ -293,10 +304,16 @@ class SecureTarDecryptingStream:
             root_key_context=self._root_key_context,
         )
         self._cipher.open()
-        size = self._ciphertext_size - IV_SIZE
+
+        # The size of the plaintext is the ciphertext size minus:
+        # - The size of the SecureTar header if present (secure tar version 2+)
+        # - The size of the IV
+        # - Padding (discarded by _DecryptingReader, not known for version 1)
+        plaintext_size_with_padding = self._ciphertext_size - IV_SIZE
         if self._cipher.securetar_header.plaintext_size is not None:
-            size -= SECURETAR_HEADER_SIZE
-        return _DecryptingReader(self._cipher, size)
+            plaintext_size_with_padding -= SECURETAR_HEADER_SIZE
+
+        return _DecryptingReader(self._cipher, plaintext_size_with_padding)
 
     def __exit__(self, exc_type, exc_value, tb) -> None:
         self._cipher.close()
@@ -314,8 +331,7 @@ class _EncryptingReader(_CipheringReader):
     ) -> None:
         """Initialize."""
         self.encrypted_size = size
-        super().__init__(source, size)
-        self._head = header
+        super().__init__(source, size, header=header)
 
     def _process_padding(self, data: bytes) -> bytes:
         """Process padding."""
@@ -347,16 +363,21 @@ class SecureTarEncryptingStream:
         )
         self._cipher.open(plaintext_size=self._plaintext_size)
 
-        encrypted_size = (
-            self._plaintext_size
+        # The ciphertext size is the sum of:
+        # - The size of the SecureTar header
+        # - The size of the IV
+        # - The size of the plaintext, padded to the next cipher block boundary
+        ciphertext_size = (
+            SECURETAR_HEADER_SIZE
+            + IV_SIZE
+            + self._plaintext_size
             + BLOCK_SIZE
             - self._plaintext_size % BLOCK_SIZE
-            + IV_SIZE
-            + SECURETAR_HEADER_SIZE
         )
+
         return _EncryptingReader(
             self._cipher,
-            encrypted_size,
+            ciphertext_size,
             header=self._cipher.securetar_header.to_bytes(),
         )
 
