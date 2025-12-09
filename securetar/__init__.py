@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Generator, Hashable
+import copy
 from dataclasses import dataclass
 import enum
 import hashlib
@@ -280,7 +281,7 @@ class _DecryptingReader(_CipheringReader):
         return data[:-padding_len]
 
 
-class SecureTarDecryptingStream:
+class _SecureTarDecryptingStream:
     """Decrypts an encrypted tar read from a stream."""
 
     _cipher: _SecureTarCipher
@@ -338,7 +339,7 @@ class _EncryptingReader(_CipheringReader):
         return data + self._source.finalize_padding()
 
 
-class SecureTarEncryptingStream:
+class _SecureTarEncryptingStream:
     """Encrypt a plaintext tar read from a stream."""
 
     _cipher: _SecureTarCipher
@@ -464,32 +465,6 @@ class SecureTarFile:
                 self._root_key_context = SecureTarRootKeyContext(password)
             else:
                 self._root_key_context = root_key_context
-
-    def create_inner_tar(
-        self,
-        name: str,
-        *,
-        gzip: bool = True,
-        password: str | None = None,
-    ) -> "_InnerSecureTarFile":
-        """Create inner tar file.
-
-        Args:
-            name: Name of the inner tar file
-            gzip: Whether to use gzip compression
-            password: Password to derive encryption key from.
-        """
-        if not self._tar:
-            raise SecureTarError("SecureTar not open")
-
-        return _InnerSecureTarFile(
-            self._tar,
-            bufsize=self._bufsize,
-            gzip=gzip,
-            mode="w",
-            name=Path(name),
-            password=password,
-        )
 
     def __enter__(self) -> tarfile.TarFile:
         """Start context manager tarfile."""
@@ -700,6 +675,149 @@ class _InnerSecureTarFile(SecureTarFile):
 
         # Finally return to the end of the outer tar file
         fileobj.seek(end_position + padding_size)
+
+
+class SecureTarArchive:
+    """Manage a plain tar archive containing encrypted inner tar files."""
+
+    def __init__(
+        self,
+        name: Path | None = None,
+        mode: Literal["r", "w"] = "r",
+        *,
+        bufsize: int = DEFAULT_BUFSIZE,
+        fileobj: IO[bytes] | None = None,
+        password: str | None = None,
+        streaming: bool = False,
+    ) -> None:
+        """Initialize archive handler.
+
+        Args:
+            name: Path to the tar file
+            mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
+            bufsize: Buffer size for I/O operations
+            fileobj: File object to use instead of opening a file
+            password: Password for encryption/decryption of inner tar files
+            streaming: Whether to use streaming mode for tarfile (no seeking)
+        """
+        if name is None and fileobj is None:
+            raise ValueError("Either filename or fileobj must be provided")
+
+        if mode not in (MOD_EXCLUSIVE, MOD_READ, MOD_WRITE):
+            raise ValueError(
+                f"Mode must be '{MOD_EXCLUSIVE}', '{MOD_READ}', or '{MOD_WRITE}'"
+            )
+
+        self._name = name
+        self._mode = mode
+        self._bufsize = bufsize
+        self._fileobj = fileobj
+        self._password = password
+        self._streaming = streaming
+        self._tar: tarfile.TarFile | None = None
+
+    def __enter__(self) -> tarfile.TarFile:
+        """Open the archive."""
+        return self.open()
+
+    def open(self) -> tarfile.TarFile:
+        """Open the archive."""
+        mode=f"{self._mode}{'|' if self._streaming else ''}"
+        self._tar = tarfile.open(
+            name=str(self._name) if self._name else None,
+            mode=mode,
+            fileobj=self._fileobj,
+            bufsize=self._bufsize,
+        )
+        return self._tar
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        """Close the archive."""
+        self.close()
+
+    def close(self) -> None:
+        """Close the archive."""
+        if self._tar:
+            self._tar.close()
+            self._tar = None
+
+    def create_inner_tar(
+        self,
+        name: str,
+        *,
+        gzip: bool = True,
+    ) -> _InnerSecureTarFile:
+        """Create an inner tar file, optionally encrypted.
+
+        Args:
+            name: Name of the inner tar file in the archive
+            gzip: Whether to use gzip compression
+        """
+        if not self._tar:
+            raise SecureTarError("Archive not open")
+        if self._streaming:
+            raise SecureTarError("create_inner_tar not supported in streaming mode")
+
+        return _InnerSecureTarFile(
+            self._tar,
+            bufsize=self._bufsize,
+            gzip=gzip,
+            mode="w",
+            name=Path(name),
+            password=self._password,
+        )
+
+    def open_inner_tar(
+        self,
+        member: tarfile.TarInfo,
+    ) -> _SecureTarDecryptingStream:
+        """Open an encrypted inner tar file for reading.
+
+        Returns a context manager that yields a readable stream of decrypted bytes.
+        The stream can be passed to tarfile.open() to read the inner tar contents.
+        """
+        if not self._tar:
+            raise SecureTarError("Archive not open")
+
+        if self._mode != MOD_READ:
+            raise SecureTarError("Archive not open for reading")
+
+        if not self._password:
+            raise SecureTarError("No password provided")
+
+        fileobj = self._tar.extractfile(member)
+        if fileobj is None:
+            raise SecureTarError(f"Cannot extract {member.name}")
+
+        return _SecureTarDecryptingStream(
+            fileobj,
+            self._password,
+            ciphertext_size=member.size,
+        )
+
+    def add_inner_tar(
+        self,
+        source: IO[bytes],
+        member: tarfile.TarInfo,
+    ) -> None:
+        """Add a tar stream as an encrypted inner tar file."""
+        if not self._tar:
+            raise SecureTarError("Archive not open")
+
+        if self._mode == MOD_READ:
+            raise SecureTarError("Archive not open for writing")
+
+        if not self._password:
+            raise SecureTarError("No password provided")
+
+        with _SecureTarEncryptingStream(
+            source,
+            self._password,
+            plaintext_size=member.size,
+        ) as encrypted:
+            encrypted_tar_info = copy.deepcopy(member)
+            encrypted_tar_info.size = encrypted.encrypted_size
+            self._tar.addfile(encrypted_tar_info, encrypted)
 
 
 @dataclass(frozen=True, kw_only=True)
