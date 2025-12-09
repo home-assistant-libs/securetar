@@ -404,7 +404,7 @@ class SecureTarFile:
 
         Args:
             name: Path to the tar file
-            mode: File mode ('r' for read, 'w' for write)
+            mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
             bufsize: Buffer size for I/O operations
             derived_key_id: Optional derived key ID for deriving key material. Mutually
             exclusive with password.
@@ -543,6 +543,7 @@ class SecureTarFile:
             mode=self._tar_mode,
             dereference=False,
             bufsize=self._bufsize,
+            **self._extra_tar_args,
         )
         return self._tar
 
@@ -573,6 +574,7 @@ class SecureTarFile:
             self._tar = None
         if self._cipher:
             self._cipher.close()
+            self._cipher = None
         if self._file:
             if not self._fileobj:
                 self._file.close()
@@ -586,7 +588,7 @@ class SecureTarFile:
     @property
     def size(self) -> float:
         """Return backup size."""
-        if not self._name.is_file():
+        if not self._name or not self._name.is_file():
             return 0
         return round(self._name.stat().st_size / 1_048_576, 2)  # calc mbyte
 
@@ -655,10 +657,11 @@ class _InnerSecureTarFile(SecureTarFile):
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         """Close file."""
+        cipher = self._cipher
         super().__exit__(exc_type, exc_value, traceback)
-        self._finalize_tar_entry()
+        self._finalize_tar_entry(cipher)
 
-    def _finalize_tar_entry(self) -> None:
+    def _finalize_tar_entry(self, cipher: _SecureTarCipher) -> None:
         """Update tar header and securetar header with final sizes."""
         outer_tar = self.outer_tar
         fileobj = self.outer_tar.fileobj
@@ -678,10 +681,10 @@ class _InnerSecureTarFile(SecureTarFile):
         outer_tar.offset += size_of_inner_tar + padding_size
 
         # Update securetar header with plaintext size if encrypted
-        if self._encrypted and self._cipher and self._cipher.padding_length:
-            self._cipher.finalize_header(size_of_inner_tar)
+        if self._encrypted and cipher and cipher.padding_length:
+            cipher.finalize_header(size_of_inner_tar)
             fileobj.seek(self._header_position + self._header_length)
-            fileobj.write(self._cipher.securetar_header.to_bytes())
+            fileobj.write(cipher.securetar_header.to_bytes())
 
         # Now that we know the size of the inner tar, we seek back
         # to where we started and re-write the header with the correct size
