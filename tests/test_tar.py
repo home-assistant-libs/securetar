@@ -239,6 +239,150 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
     assert temp_new.joinpath("README.md").is_file()
 
 
+@patch("securetar.time.time", new=Mock(return_value=1765362043.0))
+@pytest.mark.parametrize(
+    ("create_cipher_context", "expect_same_content"),
+    [(False, False), (True, True)],
+)
+def test_create_encrypted_archive_fixed_nonce(
+    tmp_path: Path, create_cipher_context: bool, expect_same_content: bool
+) -> None:
+    """Test to create an archive with fixed nonce."""
+    password = "hunter2"
+
+    # Prepare test folder
+    temp_orig = tmp_path.joinpath("orig")
+    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
+    shutil.copytree(fixture_data, temp_orig, symlinks=True)
+    with open(temp_orig / "randbytes1", "wb") as file:
+        file.write(os.urandom(12345))
+    with open(temp_orig / "randbytes2", "wb") as file:
+        file.write(os.urandom(12345))
+
+    derived_key_id = None
+    root_key_context = None
+    if create_cipher_context:
+        derived_key_id = "inner_file"
+        root_key_context = SecureTarRootKeyContext(password)
+        password = None
+
+    # Create Archive 1
+    temp_tar1 = tmp_path.joinpath("backup1.tar")
+    with SecureTarArchive(
+        temp_tar1,
+        "w",
+        password=password,
+        root_key_context=root_key_context,
+    ) as archive:
+        with archive.create_tar(
+            "core.tar", derived_key_id=derived_key_id
+        ) as inner_tar_file:
+            atomic_contents_add(
+                inner_tar_file,
+                temp_orig,
+                file_filter=lambda _: False,
+                arcname=".",
+            )
+
+    # Create Archive 2
+    temp_tar2 = tmp_path.joinpath("backup2.tar")
+    with SecureTarArchive(
+        temp_tar2,
+        "w",
+        password=password,
+        root_key_context=root_key_context,
+    ) as archive:
+        with archive.create_tar(
+            "core.tar", derived_key_id=derived_key_id
+        ) as inner_tar_file:
+            atomic_contents_add(
+                inner_tar_file,
+                temp_orig,
+                file_filter=lambda _: False,
+                arcname=".",
+            )
+
+    assert expect_same_content == (temp_tar1.read_bytes() == temp_tar2.read_bytes())
+
+
+@patch("securetar.time.time", new=Mock(return_value=1765362043.0))
+@pytest.mark.parametrize(
+    ("create_cipher_context", "expect_same_content"),
+    [(False, False), (True, True)],
+)
+def test_encrypt_archive_fixed_nonce(
+    tmp_path: Path, create_cipher_context: bool, expect_same_content: bool
+) -> None:
+    """Test to encrypt a plaintext archive with fixed nonce."""
+    password = "hunter2"
+
+    # Prepare test folder
+    temp_orig = tmp_path.joinpath("orig")
+    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
+    shutil.copytree(fixture_data, temp_orig, symlinks=True)
+    with open(temp_orig / "randbytes1", "wb") as file:
+        file.write(os.urandom(12345))
+    with open(temp_orig / "randbytes2", "wb") as file:
+        file.write(os.urandom(12345))
+
+    # Create plaintext archive to encrypt from
+    temp_tar = tmp_path.joinpath("backup.tar")
+    with SecureTarArchive(
+        temp_tar,
+        "w",
+    ) as archive:
+        with archive.create_tar(
+            "core.tar"
+        ) as inner_tar_file:
+            atomic_contents_add(
+                inner_tar_file,
+                temp_orig,
+                file_filter=lambda _: False,
+                arcname=".",
+            )
+
+    derived_key_id = None
+    root_key_context = None
+    if create_cipher_context:
+        derived_key_id = "inner_file"
+        root_key_context = SecureTarRootKeyContext(password)
+        password = None
+
+    # Create encrypted archive 1
+    temp_tar1 = tmp_path.joinpath("backup1.tar")
+    with SecureTarArchive(
+        temp_tar1,
+        "w",
+        password=password,
+        root_key_context=root_key_context,
+    ) as encrypted_archive, SecureTarArchive(
+        temp_tar,
+        "r",
+    ) as plaintext_archive:
+        for tar_info in plaintext_archive.tar:
+            encrypted_archive.import_tar(
+                plaintext_archive.tar.extractfile(tar_info), tar_info, derived_key_id=derived_key_id
+            )
+
+    # Create encrypted archive 2
+    temp_tar2 = tmp_path.joinpath("backup2.tar")
+    with SecureTarArchive(
+        temp_tar2,
+        "w",
+        password=password,
+        root_key_context=root_key_context,
+    ) as encrypted_archive, SecureTarArchive(
+        temp_tar,
+        "r",
+    ) as plaintext_archive:
+        for tar_info in plaintext_archive.tar:
+            encrypted_archive.import_tar(
+                plaintext_archive.tar.extractfile(tar_info), tar_info, derived_key_id=derived_key_id
+            )
+
+    assert expect_same_content == (temp_tar1.read_bytes() == temp_tar2.read_bytes())
+
+
 @pytest.mark.parametrize(
     ("create_cipher_context", "expect_same_content"),
     [(False, False), (True, True)],
@@ -246,7 +390,7 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 def test_create_encrypted_tar_fixed_nonce(
     tmp_path: Path, create_cipher_context: bool, expect_same_content: bool
 ) -> None:
-    """Test to create a tar file with pre-defined nonce."""
+    """Test to create a tar file with fixed nonce."""
     password = "hunter2"
 
     # Prepare test folder

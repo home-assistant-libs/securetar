@@ -287,12 +287,12 @@ class _SecureTarDecryptingStream:
     def __init__(
         self,
         source: IO[bytes],
-        password: str,
         *,
         ciphertext_size: int,
+        root_key_context: SecureTarRootKeyContext,
     ) -> None:
         self._source = source
-        self._root_key_context = SecureTarRootKeyContext(password)
+        self._root_key_context = root_key_context
         self._ciphertext_size = ciphertext_size
 
     def __enter__(self) -> _DecryptingReader:
@@ -345,13 +345,15 @@ class _SecureTarEncryptingStream:
     def __init__(
         self,
         source: IO[bytes],
-        password: str,
         *,
+        derived_key_id: Hashable | None,
         plaintext_size: int,
+        root_key_context: SecureTarRootKeyContext,
     ) -> None:
         self._source = source
-        self._root_key_context = SecureTarRootKeyContext(password)
+        self._derived_key_id = derived_key_id
         self._plaintext_size = plaintext_size
+        self._root_key_context = root_key_context
 
     def __enter__(self) -> _EncryptingReader:
         """Returns a readable stream of encrypted bytes."""
@@ -359,6 +361,7 @@ class _SecureTarEncryptingStream:
             self._source,
             CipherMode.ENCRYPT,
             root_key_context=self._root_key_context,
+            derived_key_id=self._derived_key_id,
         )
         self._cipher.open(plaintext_size=self._plaintext_size)
 
@@ -581,8 +584,9 @@ class _InnerSecureTarFile(SecureTarFile):
         mode: Literal["r", "w", "x"],
         *,
         bufsize: int,
+        derived_key_id: Hashable | None,
         gzip: bool,
-        password: str | None,
+        root_key_context: SecureTarRootKeyContext | None,
     ) -> None:
         """Initialize inner handler."""
         super().__init__(
@@ -590,8 +594,9 @@ class _InnerSecureTarFile(SecureTarFile):
             mode=mode,
             gzip=gzip,
             bufsize=bufsize,
+            derived_key_id=derived_key_id,
             fileobj=outer_tar.fileobj,
-            password=password,
+            root_key_context=root_key_context,
         )
         self.outer_tar = outer_tar
         self.stream: Generator[BinaryIO, None, None] | None = None
@@ -690,6 +695,7 @@ class SecureTarArchive:
         bufsize: int = DEFAULT_BUFSIZE,
         fileobj: IO[bytes] | None = None,
         password: str | None = None,
+        root_key_context: SecureTarRootKeyContext | None = None,
         streaming: bool = False,
     ) -> None:
         """Initialize archive handler.
@@ -699,9 +705,14 @@ class SecureTarArchive:
             mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
             bufsize: Buffer size for I/O operations
             fileobj: File object to use instead of opening a file
-            password: Password for encryption/decryption of inner tar files
+            password: Password for encryption/decryption of inner tar files. Mutually
+            exclusive with root_key_context.
+            root_key_context: Root key context to use for deriving key material. Mutually
+            exclusive with password.
             streaming: Whether to use streaming mode for tarfile (no seeking)
         """
+        if root_key_context is not None and password is not None:
+            raise ValueError("Cannot specify both 'root_key_context' and 'password'")
         if name is None and fileobj is None:
             raise ValueError("Either name or fileobj must be provided")
 
@@ -714,9 +725,13 @@ class SecureTarArchive:
         self._mode = mode
         self._bufsize = bufsize
         self._fileobj = fileobj
-        self._password = password
         self._streaming = streaming
         self._tar: tarfile.TarFile | None = None
+
+        # Set up key context
+        self._root_key_context: SecureTarRootKeyContext = root_key_context
+        if password:
+            self._root_key_context = SecureTarRootKeyContext(password)
 
     def __enter__(self) -> SecureTarArchive:
         """Open the archive."""
@@ -754,6 +769,7 @@ class SecureTarArchive:
         self,
         name: str,
         *,
+        derived_key_id: Hashable | None = None,
         gzip: bool = True,
     ) -> _InnerSecureTarFile:
         """Create a new tar file within the archive.
@@ -763,6 +779,7 @@ class SecureTarArchive:
 
         Args:
             name: Name of the inner tar file in the archive
+            derived_key_id: Optional derived key ID for deriving key material.
             gzip: Whether to use gzip compression
         """
         if not self._tar:
@@ -771,6 +788,10 @@ class SecureTarArchive:
             raise SecureTarError("Archive not open for writing")
         if self._streaming:
             raise SecureTarError("create_inner_tar not supported in streaming mode")
+        if derived_key_id is not None and self._root_key_context is None:
+            raise ValueError(
+                "Cannot specify 'derived_key_id' when encryption is not enabled"
+            )
 
         return _InnerSecureTarFile(
             self._tar,
@@ -778,7 +799,8 @@ class SecureTarArchive:
             gzip=gzip,
             mode="w",
             name=Path(name),
-            password=self._password,
+            derived_key_id=derived_key_id,
+            root_key_context=self._root_key_context,
         )
 
     def extract_tar(
@@ -798,7 +820,7 @@ class SecureTarArchive:
         if self._mode != MOD_READ:
             raise SecureTarError("Archive not open for reading")
 
-        if not self._password:
+        if not self._root_key_context:
             raise SecureTarError("No password provided")
 
         fileobj = self._tar.extractfile(member)
@@ -807,14 +829,16 @@ class SecureTarArchive:
 
         return _SecureTarDecryptingStream(
             fileobj,
-            self._password,
             ciphertext_size=member.size,
+            root_key_context=self._root_key_context,
         )
 
     def import_tar(
         self,
         source: IO[bytes],
         member: tarfile.TarInfo,
+        *,
+        derived_key_id: Hashable | None = None,
     ) -> None:
         """Import an existing tar into the archive, encrypting it.
 
@@ -822,7 +846,8 @@ class SecureTarArchive:
 
         Args:
             source: Source tar stream to encrypt and add
-            tar_info: TarInfo for the tar file (size must be set)
+            member: TarInfo for the tar file (size must be set)
+            derived_key_id: Optional derived key ID for deriving key material.
         """
         if not self._tar:
             raise SecureTarError("Archive not open")
@@ -830,13 +855,14 @@ class SecureTarArchive:
         if self._mode == MOD_READ:
             raise SecureTarError("Archive not open for writing")
 
-        if not self._password:
+        if not self._root_key_context:
             raise SecureTarError("No password provided")
 
         with _SecureTarEncryptingStream(
             source,
-            self._password,
+            derived_key_id=derived_key_id,
             plaintext_size=member.size,
+            root_key_context=self._root_key_context,
         ) as encrypted:
             encrypted_tar_info = copy.deepcopy(member)
             encrypted_tar_info.size = encrypted.encrypted_size
