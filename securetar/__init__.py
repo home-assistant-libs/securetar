@@ -716,11 +716,11 @@ class SecureTarArchive:
         self._streaming = streaming
         self._tar: tarfile.TarFile | None = None
 
-    def __enter__(self) -> tarfile.TarFile:
+    def __enter__(self) -> SecureTarArchive:
         """Open the archive."""
         return self.open()
 
-    def open(self) -> tarfile.TarFile:
+    def open(self) -> SecureTarArchive:
         """Open the archive."""
         mode = f"{self._mode}{'|' if self._streaming else ''}"
         self._tar = tarfile.open(
@@ -729,7 +729,7 @@ class SecureTarArchive:
             fileobj=self._fileobj,
             bufsize=self._bufsize,
         )
-        return self._tar
+        return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         """Close the archive."""
@@ -740,6 +740,13 @@ class SecureTarArchive:
         if self._tar:
             self._tar.close()
             self._tar = None
+
+    @property
+    def tar(self) -> tarfile.TarFile:
+        """Return the underlying tar file."""
+        if not self._tar:
+            raise SecureTarError("Archive not open")
+        return self._tar
 
     def create_tar(
         self,

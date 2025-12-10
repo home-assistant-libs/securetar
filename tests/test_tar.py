@@ -317,8 +317,7 @@ def test_tar_inside_tar(
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
-    with outer_secure_tar_archive as outer_tar_file:
+    with SecureTarArchive(main_tar, "w") as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
@@ -330,15 +329,15 @@ def test_tar_inside_tar(
                     arcname=".",
                 )
 
-        assert len(outer_tar_file.getmembers()) == 3
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 3
 
         raw_bytes = b'{"test": "test"}'
         fileobj = io.BytesIO(raw_bytes)
         tar_info = tarfile.TarInfo(name="backup.json")
         tar_info.size = len(raw_bytes)
         tar_info.mtime = time.time()
-        outer_tar_file.addfile(tar_info, fileobj=fileobj)
-        assert len(outer_tar_file.getmembers()) == 4
+        outer_secure_tar_archive.tar.addfile(tar_info, fileobj=fileobj)
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 4
 
     assert main_tar.exists()
 
@@ -412,8 +411,7 @@ def test_tar_inside_tar_encrypt(
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
-    with outer_secure_tar_archive as outer_tar_file:
+    with SecureTarArchive(main_tar, "w") as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
@@ -425,15 +423,15 @@ def test_tar_inside_tar_encrypt(
                     arcname=".",
                 )
 
-        assert len(outer_tar_file.getmembers()) == 3
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 3
 
         raw_bytes = b'{"test": "test"}'
         fileobj = io.BytesIO(raw_bytes)
         tar_info = tarfile.TarInfo(name="backup.json")
         tar_info.size = len(raw_bytes)
         tar_info.mtime = time.time()
-        outer_tar_file.addfile(tar_info, fileobj=fileobj)
-        assert len(outer_tar_file.getmembers()) == 4
+        outer_secure_tar_archive.tar.addfile(tar_info, fileobj=fileobj)
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 4
 
     assert main_tar.exists()
 
@@ -517,8 +515,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
-    with outer_secure_tar_archive as outer_tar_file:
+    with SecureTarArchive(main_tar, "w") as outer_secure_tar_archive:
         # Make the first tar file to ensure that
         # the second tar file can still be created
         with pytest.raises(ValueError, match="Test"):
@@ -539,7 +536,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
                 )
                 raise ValueError("Test")
 
-        assert len(outer_tar_file.getmembers()) == 2
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 2
 
     assert main_tar.exists()
     # Restore
@@ -598,10 +595,9 @@ def test_encrypted_tar_inside_tar(
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_archive = SecureTarArchive(
+    with SecureTarArchive(
         main_tar, "w", bufsize=bufsize, password=password
-    )
-    with outer_secure_tar_archive as outer_tar_file:
+    ) as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
@@ -613,7 +609,7 @@ def test_encrypted_tar_inside_tar(
                     arcname=".",
                 )
 
-        assert len(outer_tar_file.getmembers()) == 3
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 3
 
     assert main_tar.exists()
 
