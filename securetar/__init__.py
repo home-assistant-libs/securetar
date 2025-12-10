@@ -194,11 +194,9 @@ class _SecureTarCipher:
         return b""
 
     def close(self) -> None:
-        """Finalize and write padding if not already finalized."""
-        if self._padder:  # Only if not already finalized
-            padding_bytes = self.finalize_padding()
-            if padding_bytes:
-                self._file.write(padding_bytes)
+        """Mark as closed."""
+        self._cipher = None
+        self._padder = None
 
 
 class _CipheringReader:
@@ -572,6 +570,8 @@ class SecureTarFile:
             self._tar.close()
             self._tar = None
         if self._cipher:
+            if self._mode != MOD_READ:
+                self._file.write(self._cipher.finalize_padding())
             self._cipher.close()
         if self._file:
             if not self._fileobj:
