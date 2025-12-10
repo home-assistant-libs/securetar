@@ -248,7 +248,7 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
         ("inner_file", lambda: SecureTarRootKeyContext("hunter2"), None, True),
     ],
 )
-def test_encrypt_archive_fixed_nonce(
+def test_create_encrypted_archive_fixed_nonce(
     tmp_path: Path,
     derived_key_id: Hashable | None,
     root_key_context_func: Callable[[str | None], SecureTarRootKeyContext],
