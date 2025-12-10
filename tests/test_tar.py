@@ -320,7 +320,7 @@ def test_tar_inside_tar(
     outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
     with outer_secure_tar_archive as outer_tar_file:
         for inner_tar_file in inner_tar_files:
-            with outer_secure_tar_archive.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
             ) as inner_tar_file:
                 atomic_contents_add(
@@ -415,7 +415,7 @@ def test_tar_inside_tar_encrypt(
     outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
     with outer_secure_tar_archive as outer_tar_file:
         for inner_tar_file in inner_tar_files:
-            with outer_secure_tar_archive.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
             ) as inner_tar_file:
                 atomic_contents_add(
@@ -522,13 +522,13 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
         # Make the first tar file to ensure that
         # the second tar file can still be created
         with pytest.raises(ValueError, match="Test"):
-            with outer_secure_tar_archive.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 "failed.tar.gz", gzip=True
             ) as inner_tar_file:
                 raise ValueError("Test")
 
         with pytest.raises(ValueError, match="Test"):
-            with outer_secure_tar_archive.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 "good.tar.gz", gzip=True
             ) as inner_tar_file:
                 atomic_contents_add(
@@ -603,7 +603,7 @@ def test_encrypted_tar_inside_tar(
     )
     with outer_secure_tar_archive as outer_tar_file:
         for inner_tar_file in inner_tar_files:
-            with outer_secure_tar_archive.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
             ) as inner_tar_file:
                 atomic_contents_add(
@@ -812,7 +812,7 @@ def test_inner_tar_not_allowed_in_streaming(tmp_path: Path) -> None:
 
     with pytest.raises(SecureTarError):
         with outer_secure_tar_archive:
-            with outer_secure_tar_archive.create_inner_tar("any.tgz", gzip=True):
+            with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
                 pass
 
 
@@ -822,7 +822,7 @@ def test_outer_tar_must_be_open(tmp_path: Path) -> None:
     outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
 
     with pytest.raises(SecureTarError):
-        with outer_secure_tar_archive.create_inner_tar("any.tgz", gzip=True):
+        with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
             pass
 
 
@@ -837,7 +837,7 @@ def test_outer_tar_open_close(tmp_path: Path) -> None:
     outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
 
     outer_secure_tar_archive.open()
-    with outer_secure_tar_archive.create_inner_tar("any.tgz", gzip=True) as tar_file:
+    with outer_secure_tar_archive.create_tar("any.tgz", gzip=True) as tar_file:
         atomic_contents_add(
             tar_file,
             temp_orig,
@@ -863,7 +863,7 @@ def test_outer_tar_exclusive_mode(tmp_path: Path) -> None:
     outer_secure_tar_archive = SecureTarArchive(main_tar, "x", password=password)
 
     with outer_secure_tar_archive:
-        with outer_secure_tar_archive.create_inner_tar("any.tgz", gzip=True):
+        with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
             pass
 
     assert main_tar.exists()

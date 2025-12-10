@@ -741,13 +741,16 @@ class SecureTarArchive:
             self._tar.close()
             self._tar = None
 
-    def create_inner_tar(
+    def create_tar(
         self,
         name: str,
         *,
         gzip: bool = True,
     ) -> _InnerSecureTarFile:
-        """Create an inner tar file, optionally encrypted.
+        """Create a new tar file within the archive.
+
+        Returns a context manager that yields a TarFile for adding files.
+        The tar file will be encrypted if a password was provided to the archive.
 
         Args:
             name: Name of the inner tar file in the archive
@@ -769,14 +772,16 @@ class SecureTarArchive:
             password=self._password,
         )
 
-    def open_inner_tar(
+    def extract_tar(
         self,
         member: tarfile.TarInfo,
     ) -> _SecureTarDecryptingStream:
-        """Open an encrypted inner tar file for reading.
+        """Extract and decrypt a tar file from the archive.
 
         Returns a context manager that yields a readable stream of decrypted bytes.
-        The stream can be passed to tarfile.open() to read the inner tar contents.
+
+        Args:
+            member: TarInfo of the tar file to extract
         """
         if not self._tar:
             raise SecureTarError("Archive not open")
@@ -797,12 +802,19 @@ class SecureTarArchive:
             ciphertext_size=member.size,
         )
 
-    def add_inner_tar(
+    def add_tar(
         self,
         source: IO[bytes],
         member: tarfile.TarInfo,
     ) -> None:
-        """Add a tar stream as an encrypted inner tar file."""
+        """Add an existing tar to the archive, encrypting it.
+
+        The tar_info.size must be set to the size of the source stream.
+
+        Args:
+            source: Source tar stream to encrypt and add
+            tar_info: TarInfo for the tar file (size must be set)
+        """
         if not self._tar:
             raise SecureTarError("Archive not open")
 
