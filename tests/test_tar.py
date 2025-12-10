@@ -15,8 +15,8 @@ from unittest.mock import Mock, patch
 import pytest
 
 from securetar import (
-    AddFileError,
     SECURETAR_MAGIC,
+    AddFileError,
     SecureTarArchive,
     SecureTarError,
     SecureTarFile,
@@ -180,7 +180,8 @@ def test_create_with_error(
 
 
 @pytest.mark.parametrize("bufsize", [333, 10240, 4 * 2**20])
-def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
+@pytest.mark.parametrize("enable_gzip", [True, False])
+def test_create_encrypted_tar(tmp_path: Path, bufsize: int, enable_gzip: bool) -> None:
     """Test to create a tar file with encryption."""
     password = "hunter2"
 
@@ -195,7 +196,9 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(temp_tar, "w", password=password, bufsize=bufsize) as tar_file:
+    with SecureTarFile(
+        temp_tar, "w", password=password, bufsize=bufsize, gzip=enable_gzip
+    ) as tar_file:
         atomic_contents_add(
             tar_file,
             temp_orig,
@@ -207,7 +210,9 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 
     # Iterate over the tar file
     files = set()
-    with SecureTarFile(temp_tar, "r", password=password, bufsize=bufsize) as tar_file:
+    with SecureTarFile(
+        temp_tar, "r", password=password, bufsize=bufsize, gzip=enable_gzip
+    ) as tar_file:
         for tar_info in tar_file:
             files.add(tar_info.name)
     assert files == {
@@ -222,7 +227,9 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(temp_tar, "r", password=password, bufsize=bufsize) as tar_file:
+    with SecureTarFile(
+        temp_tar, "r", password=password, bufsize=bufsize, gzip=enable_gzip
+    ) as tar_file:
         tar_file.extractall(path=temp_new, members=tar_file)
 
     assert temp_new.is_dir()
@@ -436,6 +443,7 @@ def test_encrypt_archive_fixed_nonce(
     assert expect_same_content == (temp_tar1.read_bytes() == temp_tar2.read_bytes())
 
 
+@patch("securetar.time.time", new=Mock(return_value=1765362043.0))
 @pytest.mark.parametrize(
     ("create_cipher_context", "expect_same_content"),
     [(False, False), (True, True)],
