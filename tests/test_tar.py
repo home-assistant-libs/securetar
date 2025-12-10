@@ -598,7 +598,9 @@ def test_encrypted_tar_inside_tar(
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_archive = SecureTarArchive(main_tar, "w", bufsize=bufsize, password=password)
+    outer_secure_tar_archive = SecureTarArchive(
+        main_tar, "w", bufsize=bufsize, password=password
+    )
     with outer_secure_tar_archive as outer_tar_file:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_archive.create_inner_tar(
@@ -861,9 +863,7 @@ def test_outer_tar_exclusive_mode(tmp_path: Path) -> None:
     outer_secure_tar_archive = SecureTarArchive(main_tar, "x", password=password)
 
     with outer_secure_tar_archive:
-        with outer_secure_tar_archive.create_inner_tar(
-            "any.tgz", gzip=True
-        ):
+        with outer_secure_tar_archive.create_inner_tar("any.tgz", gzip=True):
             pass
 
     assert main_tar.exists()
