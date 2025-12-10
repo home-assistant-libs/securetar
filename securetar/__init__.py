@@ -543,7 +543,6 @@ class SecureTarFile:
             mode=self._tar_mode,
             dereference=False,
             bufsize=self._bufsize,
-            **self._extra_tar_args,
         )
         return self._tar
 
