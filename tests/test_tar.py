@@ -16,8 +16,7 @@ import pytest
 from securetar import (
     AddFileError,
     SECURETAR_MAGIC,
-    SecureTarDecryptingStream,
-    SecureTarEncryptingStream,
+    SecureTarArchive,
     SecureTarError,
     SecureTarFile,
     SecureTarReadError,
@@ -316,10 +315,9 @@ def test_tar_inside_tar(
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", gzip=False)
-    with outer_secure_tar_file as outer_tar_file:
+    with SecureTarArchive(main_tar, "w") as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
-            with outer_secure_tar_file.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
             ) as inner_tar_file:
                 atomic_contents_add(
@@ -329,15 +327,15 @@ def test_tar_inside_tar(
                     arcname=".",
                 )
 
-        assert len(outer_tar_file.getmembers()) == 3
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 3
 
         raw_bytes = b'{"test": "test"}'
         fileobj = io.BytesIO(raw_bytes)
         tar_info = tarfile.TarInfo(name="backup.json")
         tar_info.size = len(raw_bytes)
         tar_info.mtime = time.time()
-        outer_tar_file.addfile(tar_info, fileobj=fileobj)
-        assert len(outer_tar_file.getmembers()) == 4
+        outer_secure_tar_archive.tar.addfile(tar_info, fileobj=fileobj)
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 4
 
     assert main_tar.exists()
 
@@ -409,12 +407,11 @@ def test_tar_inside_tar_encrypt(
     fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
     shutil.copytree(fixture_data, temp_orig, symlinks=True)
 
-    # Create Tarfile
+    # Create an archive with plaintext inner tars
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", gzip=False)
-    with outer_secure_tar_file as outer_tar_file:
+    with SecureTarArchive(main_tar, "w") as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
-            with outer_secure_tar_file.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
             ) as inner_tar_file:
                 atomic_contents_add(
@@ -424,67 +421,75 @@ def test_tar_inside_tar_encrypt(
                     arcname=".",
                 )
 
-        assert len(outer_tar_file.getmembers()) == 3
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 3
 
         raw_bytes = b'{"test": "test"}'
         fileobj = io.BytesIO(raw_bytes)
         tar_info = tarfile.TarInfo(name="backup.json")
         tar_info.size = len(raw_bytes)
         tar_info.mtime = time.time()
-        outer_tar_file.addfile(tar_info, fileobj=fileobj)
-        assert len(outer_tar_file.getmembers()) == 4
+        outer_secure_tar_archive.tar.addfile(tar_info, fileobj=fileobj)
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 4
 
     assert main_tar.exists()
 
-    # Iterate over the tar file, and check there's no securetar header
+    # Iterate over the archive, and check there are no securetar headers in
+    # the inner tars
     files = set()
-    with SecureTarFile(main_tar, "r", gzip=False) as tar_file:
-        for tar_info in tar_file:
-            inner_tar = tar_file.extractfile(tar_info)
+    with SecureTarArchive(main_tar, "r") as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            inner_tar = outer_secure_tar_archive.tar.extractfile(tar_info)
             assert inner_tar.read(len(SECURETAR_MAGIC)) != SECURETAR_MAGIC
             files.add(tar_info.name)
     assert files == {"backup.json", *inner_tar_files}
 
-    # Encrypt the inner tar files
+    # Create an archive with encrypted inner tars, streamed from the archive
+    # with plaintext inner tars
     password = "hunter2"
     temp_encrypted = tmp_path.joinpath("encrypted")
+    main_tar_encrypted = temp_encrypted.joinpath("backup.tar")
     os.makedirs(temp_encrypted, exist_ok=True)
-    with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
-        for inner_tar_file in inner_tar_files:
-            tar_info = tar_file.getmember(inner_tar_file)
-            inner_tar_path = temp_encrypted.joinpath(tar_info.name)
-            with open(inner_tar_path, "wb") as file:
-                with SecureTarEncryptingStream(
-                    tar_file.extractfile(tar_info),
-                    password,
-                    plaintext_size=tar_info.size,
-                ) as encrypted:
-                    read = 0
-                    while data := encrypted.read(bufsize):
-                        read += len(data)
-                        file.write(data)
-                    assert read == encrypted.encrypted_size
-
-            # Check the indicated size is correct
-            assert (
-                inner_tar_path.stat().st_size
-                == tar_info.size + 16 - tar_info.size % 16 + 16 + 32
+    with (
+        SecureTarArchive(
+            main_tar_encrypted,
+            mode="w",
+            password=password,
+            bufsize=bufsize,
+            streaming=True,
+        ) as encrypted_archive,
+        SecureTarArchive(
+            main_tar, "r", bufsize=bufsize, streaming=True
+        ) as plain_archive,
+    ):
+        for tar_info in plain_archive.tar:
+            encrypted_archive.import_tar(
+                plain_archive.tar.extractfile(tar_info), tar_info
             )
 
-    # Check the encrypted files can be opened
+    # Check size of encrypted inner tars
+    with (
+        SecureTarArchive(
+            main_tar_encrypted, mode="r", password=password, bufsize=bufsize
+        ) as encrypted_archive,
+        SecureTarArchive(main_tar, "r", bufsize=bufsize) as plain_archive,
+    ):
+        for inner_tar_file in inner_tar_files:
+            encrypted_tar_info = encrypted_archive.tar.getmember(inner_tar_file)
+            plain_tar_info = plain_archive.tar.getmember(inner_tar_file)
+            assert (
+                encrypted_tar_info.size
+                == plain_tar_info.size + 16 - plain_tar_info.size % 16 + 16 + 32
+            )
+
+    # Check the encrypted inner tars can be opened
     temp_decrypted = tmp_path.joinpath("decrypted")
     os.makedirs(temp_decrypted, exist_ok=True)
-    for inner_tar_file in inner_tar_files:
-        encrypted_inner_tar_path = temp_encrypted.joinpath(inner_tar_file)
-        with open(encrypted_inner_tar_path, "rb") as encrypted_inner_tar:
-            tar_info = tarfile.TarInfo(inner_tar_file)
-            tar_info.size = encrypted_inner_tar_path.stat().st_size
-        with open(encrypted_inner_tar_path, "rb") as encrypted_inner_tar:
-            decrypted_inner_tar_path = temp_decrypted.joinpath(inner_tar_file)
-            with open(decrypted_inner_tar_path, "wb") as file:
-                with SecureTarDecryptingStream(
-                    encrypted_inner_tar, password, ciphertext_size=tar_info.size
-                ) as decrypted:
+    with SecureTarArchive(main_tar_encrypted, password=password) as encrypted_archive:
+        for inner_tar_file in inner_tar_files:
+            encrypted_tar_info = encrypted_archive.tar.getmember(inner_tar_file)
+            with encrypted_archive.extract_tar(encrypted_tar_info) as decrypted:
+                decrypted_inner_tar_path = temp_decrypted.joinpath(inner_tar_file)
+                with open(decrypted_inner_tar_path, "wb") as file:
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
@@ -516,18 +521,17 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", gzip=False)
-    with outer_secure_tar_file as outer_tar_file:
+    with SecureTarArchive(main_tar, "w") as outer_secure_tar_archive:
         # Make the first tar file to ensure that
         # the second tar file can still be created
         with pytest.raises(ValueError, match="Test"):
-            with outer_secure_tar_file.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 "failed.tar.gz", gzip=True
             ) as inner_tar_file:
                 raise ValueError("Test")
 
         with pytest.raises(ValueError, match="Test"):
-            with outer_secure_tar_file.create_inner_tar(
+            with outer_secure_tar_archive.create_tar(
                 "good.tar.gz", gzip=True
             ) as inner_tar_file:
                 atomic_contents_add(
@@ -538,7 +542,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
                 )
                 raise ValueError("Test")
 
-        assert len(outer_tar_file.getmembers()) == 2
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 2
 
     assert main_tar.exists()
     # Restore
@@ -595,13 +599,14 @@ def test_encrypted_tar_inside_tar(
     fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
     shutil.copytree(fixture_data, temp_orig, symlinks=True)
 
-    # Create Tarfile
+    # Create an archive with encrypted inner tars
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", gzip=False, bufsize=bufsize)
-    with outer_secure_tar_file as outer_tar_file:
+    with SecureTarArchive(
+        main_tar, "w", bufsize=bufsize, password=password
+    ) as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
-            with outer_secure_tar_file.create_inner_tar(
-                inner_tar_file, password=password, gzip=enable_gzip
+            with outer_secure_tar_archive.create_tar(
+                inner_tar_file, gzip=enable_gzip
             ) as inner_tar_file:
                 atomic_contents_add(
                     inner_tar_file,
@@ -610,31 +615,29 @@ def test_encrypted_tar_inside_tar(
                     arcname=".",
                 )
 
-        assert len(outer_tar_file.getmembers()) == 3
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 3
 
     assert main_tar.exists()
 
-    # Iterate over the tar file
+    # Iterate over the archive
     file_sizes: dict[str, int] = {}
-    with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
-        for tar_info in tar_file:
-            inner_tar = tar_file.extractfile(tar_info)
+    with SecureTarArchive(main_tar, "r", bufsize=bufsize) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            inner_tar = outer_secure_tar_archive.tar.extractfile(tar_info)
             assert inner_tar.read(len(SECURETAR_MAGIC)) == SECURETAR_MAGIC
             file_sizes[tar_info.name] = int.from_bytes(inner_tar.read(8), "big")
     assert set(file_sizes) == {*inner_tar_files}
 
-    # Decrypt the inner tar with wrong key
+    # Attempt to decrypt the inner tars with wrong key
     temp_decrypted = tmp_path.joinpath("decrypted")
     os.makedirs(temp_decrypted, exist_ok=True)
-    with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
-        for tar_info in tar_file:
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with SecureTarDecryptingStream(
-                    tar_file.extractfile(tar_info),
-                    "wrong password",
-                    ciphertext_size=tar_info.size,
-                ) as decrypted:
+                with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
                     with pytest.raises(
                         SecureTarReadError, match="The inner tar is not gzip or tar"
                     ):
@@ -644,15 +647,13 @@ def test_encrypted_tar_inside_tar(
     # Decrypt the inner tar
     temp_decrypted = tmp_path.joinpath("decrypted")
     os.makedirs(temp_decrypted, exist_ok=True)
-    with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
-        for tar_info in tar_file:
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with SecureTarDecryptingStream(
-                    tar_file.extractfile(tar_info),
-                    password,
-                    ciphertext_size=tar_info.size,
-                ) as decrypted:
+                with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
@@ -724,9 +725,9 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
 
     # Iterate over the tar file, and check there's no securetar header
     files: set[str] = set()
-    with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
-        for tar_info in tar_file:
-            inner_tar = tar_file.extractfile(tar_info)
+    with SecureTarArchive(main_tar, "r", bufsize=bufsize) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            inner_tar = outer_secure_tar_archive.tar.extractfile(tar_info)
             assert inner_tar.read(len(SECURETAR_MAGIC)) != SECURETAR_MAGIC
             files.add(tar_info.name)
     assert files == {
@@ -744,16 +745,14 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
             "securetar.SecureTarRootKeyContext._password_to_key",
             return_value=b"0123456789abcdef",
         ),
-        SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file,
+        SecureTarArchive(
+            main_tar, "r", bufsize=bufsize, password=password
+        ) as outer_secure_tar_archive,
     ):
-        for tar_info in tar_file:
+        for tar_info in outer_secure_tar_archive.tar:
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with SecureTarDecryptingStream(
-                    tar_file.extractfile(tar_info),
-                    password,
-                    ciphertext_size=tar_info.size,
-                ) as decrypted:
+                with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
@@ -801,37 +800,25 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
             }
 
 
-def test_inner_tar_not_allowed_in_encrypted(tmp_path: Path) -> None:
+def test_inner_tar_not_allowed_in_streaming(tmp_path: Path) -> None:
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    password = "hunter2"
 
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", password=password, gzip=False)
+    outer_secure_tar_archive = SecureTarArchive(main_tar, "w", streaming=True)
 
-    with pytest.raises(tarfile.StreamError):
-        with outer_secure_tar_file:
-            with outer_secure_tar_file.create_inner_tar("any.tgz", gzip=True):
-                pass
-
-
-def test_outer_tar_must_not_be_compressed(tmp_path: Path) -> None:
-    # Create Tarfile
-    main_tar = tmp_path.joinpath("backup.tar.gz")
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", gzip=True)
-
-    with pytest.raises(OSError):
-        with outer_secure_tar_file:
-            with outer_secure_tar_file.create_inner_tar("any.tgz", gzip=True):
+    with pytest.raises(SecureTarError):
+        with outer_secure_tar_archive:
+            with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
                 pass
 
 
 def test_outer_tar_must_be_open(tmp_path: Path) -> None:
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", gzip=False)
+    outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
 
     with pytest.raises(SecureTarError):
-        with outer_secure_tar_file.create_inner_tar("any.tgz", gzip=True):
+        with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
             pass
 
 
@@ -843,10 +830,10 @@ def test_outer_tar_open_close(tmp_path: Path) -> None:
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_file = SecureTarFile(main_tar, "w", gzip=False)
+    outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
 
-    outer_secure_tar_file.open()
-    with outer_secure_tar_file.create_inner_tar("any.tgz", gzip=True) as tar_file:
+    outer_secure_tar_archive.open()
+    with outer_secure_tar_archive.create_tar("any.tgz", gzip=True) as tar_file:
         atomic_contents_add(
             tar_file,
             temp_orig,
@@ -854,7 +841,7 @@ def test_outer_tar_open_close(tmp_path: Path) -> None:
             arcname=".",
         )
 
-    outer_secure_tar_file.close()
+    outer_secure_tar_archive.close()
 
     # Restore
     temp_new = tmp_path.joinpath("new")
@@ -869,12 +856,10 @@ def test_outer_tar_exclusive_mode(tmp_path: Path) -> None:
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
     password = "hunter2"
-    outer_secure_tar_file = SecureTarFile(main_tar, "x", gzip=False)
+    outer_secure_tar_archive = SecureTarArchive(main_tar, "x", password=password)
 
-    with outer_secure_tar_file:
-        with outer_secure_tar_file.create_inner_tar(
-            "any.tgz", password=password, gzip=True
-        ):
+    with outer_secure_tar_archive:
+        with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
             pass
 
     assert main_tar.exists()
