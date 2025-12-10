@@ -106,6 +106,16 @@ class SecureTarReadError(SecureTarError):
     """SecureTar read error."""
 
 
+def _is_valid_tar_header(data: bytes) -> bool:
+    """Check if data looks like a valid tar or gzip header."""
+    is_gzip = data[: len(GZIP_MAGIC_BYTES)] == GZIP_MAGIC_BYTES
+    is_tar = (
+        data[TAR_MAGIC_OFFSET : TAR_MAGIC_OFFSET + len(TAR_MAGIC_BYTES)]
+        == TAR_MAGIC_BYTES
+    )
+    return is_gzip or is_tar
+
+
 class _CipherIO:
     """Base class for SecureTar cipher operations."""
 
@@ -315,22 +325,13 @@ class _FramedReader:
 class _FramedDecryptingReader(_FramedReader):
     """Decrypt a stream with framing."""
 
-    @staticmethod
-    def _validate_inner_tar(head: bytes) -> None:
-        """Validate inner tar."""
-        if (
-            head[0 : len(GZIP_MAGIC_BYTES)] != GZIP_MAGIC_BYTES
-            and head[TAR_MAGIC_OFFSET : TAR_MAGIC_OFFSET + len(TAR_MAGIC_BYTES)]
-            != TAR_MAGIC_BYTES
-        ):
-            raise SecureTarReadError("The inner tar is not gzip or tar, wrong key?")
-
     def read(self, size: int = 0) -> bytes:
         """Read data."""
         if self._head is None:
             # Read and validate header
             self._head = self._source.read(max(size, TAR_BLOCK_SIZE))
-            self._validate_inner_tar(self._head)
+            if not _is_valid_tar_header(self._head):
+                raise SecureTarReadError("The inner tar is not gzip or tar, wrong key?")
 
         return super().read(size)
 
@@ -377,6 +378,21 @@ class _SecureTarDecryptStream:
 
     def __exit__(self, exc_type, exc_value, tb) -> None:
         self._cipher.close()
+
+    def validate(self) -> bool:
+        """Validate the password by checking if decrypted data looks like a tar.
+
+        Note: This consumes the stream. Create a new instance to read data.
+
+        Returns:
+            True if password is valid, False otherwise.
+        """
+        with self as reader:
+            try:
+                reader.read(1)
+                return True
+            except SecureTarReadError:
+                return False
 
 
 class _FramedEncryptingReader(_FramedReader):
@@ -614,6 +630,47 @@ class SecureTarFile:
             if not self._fileobj:
                 self._file.close()
             self._file = None
+
+    def validate_password(self) -> bool:
+        """Validate the password by checking if decrypted data looks like a tar.
+
+        Note: If using fileobj instead of a file path, this consumes the stream
+        and a new SecureTarFile instance must be created to read data.
+
+        Returns:
+            True if password is valid, False otherwise.
+
+        Raises:
+            SecureTarError: If file is not encrypted, not in read mode, or already open.
+        """
+        if not self._encrypted:
+            raise SecureTarError("File is not encrypted")
+
+        if self._mode != MOD_READ:
+            raise SecureTarError("Can only validate password in read mode")
+
+        if self._tar is not None:
+            raise SecureTarError("File is already open")
+
+        if TYPE_CHECKING:
+            assert self._root_key_context is not None
+
+        file = self._open_file()
+        try:
+            cipher = _CipherReader(
+                file,
+                CipherMode.DECRYPT,
+                root_key_context=self._root_key_context,
+            )
+            cipher.open()
+
+            data = cipher.read(TAR_BLOCK_SIZE)
+            cipher.close()
+
+            return _is_valid_tar_header(data)
+        finally:
+            if not self._fileobj:
+                file.close()
 
     @property
     def path(self) -> Path:
@@ -925,6 +982,25 @@ class SecureTarArchive:
             encrypted_tar_info = copy.deepcopy(member)
             encrypted_tar_info.size = encrypted.encrypted_size
             self._tar.addfile(encrypted_tar_info, encrypted)
+
+    def validate_password(self, member: tarfile.TarInfo) -> bool:
+        """Validate the password against an encrypted inner tar.
+
+        Note: This consumes the stream. Create a new instance to read data.
+
+        Args:
+            member: TarInfo of an encrypted tar file to validate against
+        """
+        if not self._tar:
+            raise SecureTarError("Archive not open")
+
+        if self._mode != MOD_READ:
+            raise SecureTarError("Archive not open for reading")
+
+        if not self._root_key_context:
+            raise SecureTarError("No password provided")
+
+        return self.extract_tar(member).validate()
 
 
 @dataclass(frozen=True, kw_only=True)
