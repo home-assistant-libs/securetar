@@ -240,6 +240,50 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
     assert temp_new.joinpath("README.md").is_file()
 
 
+@pytest.mark.parametrize("bufsize", [333, 10240, 4 * 2**20])
+@pytest.mark.parametrize("enable_gzip", [True, False])
+def test_create_encrypted_tar_validate_password(
+    tmp_path: Path, bufsize: int, enable_gzip: bool
+) -> None:
+    """Test to create a tar file with encryption."""
+    password = "hunter2"
+
+    # Prepare test folder
+    temp_orig = tmp_path.joinpath("orig")
+    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
+    shutil.copytree(fixture_data, temp_orig, symlinks=True)
+    with open(temp_orig / "randbytes1", "wb") as file:
+        file.write(os.urandom(12345))
+    with open(temp_orig / "randbytes2", "wb") as file:
+        file.write(os.urandom(12345))
+
+    # Create Tarfile
+    temp_tar = tmp_path.joinpath("backup.tar")
+    with SecureTarFile(
+        temp_tar, "w", password=password, bufsize=bufsize, gzip=enable_gzip
+    ) as tar_file:
+        atomic_contents_add(
+            tar_file,
+            temp_orig,
+            file_filter=lambda _: False,
+            arcname=".",
+        )
+
+    assert temp_tar.exists()
+
+    # Attempt to validate with wrong password
+    secure_tar_file = SecureTarFile(
+        temp_tar, "r", bufsize=bufsize, password="wrong_password", gzip=enable_gzip
+    )
+    assert not secure_tar_file.validate_password()
+
+    # Attempt to validate with correct password
+    secure_tar_file = SecureTarFile(
+        temp_tar, "r", bufsize=bufsize, password=password, gzip=enable_gzip
+    )
+    assert secure_tar_file.validate_password()
+
+
 @patch("securetar.time.time", new=Mock(return_value=1765362043.0))
 @pytest.mark.parametrize(
     ("derived_key_id", "root_key_context_func", "password", "expect_same_content"),
@@ -865,6 +909,59 @@ def test_encrypted_tar_inside_tar(
             "775",
         ]
         assert temp_inner_new.joinpath("README.md").is_file()
+
+
+@pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("enable_gzip", "inner_tar_files"),
+    [
+        (True, ("core.tar.gz", "core2.tar.gz", "core3.tar.gz")),
+        (False, ("core.tar", "core2.tar", "core3.tar")),
+    ],
+)
+def test_encrypted_tar_inside_tar_validate_password(
+    tmp_path: Path, bufsize: int, enable_gzip: bool, inner_tar_files: tuple[str, ...]
+) -> None:
+    password = "hunter2"
+
+    # Prepare test folder
+    temp_orig = tmp_path.joinpath("orig")
+    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
+    shutil.copytree(fixture_data, temp_orig, symlinks=True)
+
+    # Create an archive with encrypted inner tars
+    main_tar = tmp_path.joinpath("backup.tar")
+    with SecureTarArchive(
+        main_tar, "w", bufsize=bufsize, password=password
+    ) as outer_secure_tar_archive:
+        for inner_tar_file in inner_tar_files:
+            with outer_secure_tar_archive.create_tar(
+                inner_tar_file, gzip=enable_gzip
+            ) as inner_tar_file:
+                atomic_contents_add(
+                    inner_tar_file,
+                    temp_orig,
+                    file_filter=lambda _: False,
+                    arcname=".",
+                )
+
+        assert len(outer_secure_tar_archive.tar.getmembers()) == 3
+
+    assert main_tar.exists()
+
+    # Attempt to validate the inner tars with wrong password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate_password(tar_info)
+
+    # Attempt to validate the inner tars with correct password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert outer_secure_tar_archive.validate_password(tar_info)
 
 
 @pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
