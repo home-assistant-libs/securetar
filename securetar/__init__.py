@@ -755,6 +755,8 @@ class SecureTarArchive:
         """
         if not self._tar:
             raise SecureTarError("Archive not open")
+        if self._mode == MOD_READ:
+            raise SecureTarError("Archive not open for writing")
         if self._streaming:
             raise SecureTarError("create_inner_tar not supported in streaming mode")
 
