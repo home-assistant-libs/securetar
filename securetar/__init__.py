@@ -722,7 +722,7 @@ class SecureTarArchive:
 
     def open(self) -> tarfile.TarFile:
         """Open the archive."""
-        mode=f"{self._mode}{'|' if self._streaming else ''}"
+        mode = f"{self._mode}{'|' if self._streaming else ''}"
         self._tar = tarfile.open(
             name=str(self._name) if self._name else None,
             mode=mode,
