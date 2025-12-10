@@ -125,6 +125,14 @@ class _CipherIO:
         self.securetar_header: SecureTarHeader | None = None
         self.padding_length = 0
 
+    def _open_for_decrypt(self, source: IO[bytes]) -> None:
+        """Initialize cipher for decryption."""
+        self.securetar_header = SecureTarHeader.from_bytes(source)
+        derived_key_material = self._root_key_context.restore_key_material(
+            header=self.securetar_header
+        )
+        self._setup_cipher(derived_key_material)
+
     def _open_for_encrypt(self, plaintext_size: int | None) -> None:
         """Initialize cipher for encryption."""
         derived_key_material = self._root_key_context.derive_key_material(
@@ -133,14 +141,6 @@ class _CipherIO:
         self.securetar_header = SecureTarHeader(
             derived_key_material.nonce,
             plaintext_size,
-        )
-        self._setup_cipher(derived_key_material)
-
-    def _open_for_decrypt(self, source: IO[bytes]) -> None:
-        """Initialize cipher for decryption."""
-        self.securetar_header = SecureTarHeader.from_bytes(source)
-        derived_key_material = self._root_key_context.restore_key_material(
-            header=self.securetar_header
         )
         self._setup_cipher(derived_key_material)
 
@@ -159,7 +159,10 @@ class _CipherIO:
         self._padder = padding.PKCS7(BLOCK_SIZE_BITS).padder()
 
     def finalize_padding(self) -> bytes:
-        """Return final padding block. Can only be called once."""
+        """Return final padding block.
+
+        Can only be called once.
+        """
         if not self._cipher or not self._padder:
             raise SecureTarError("Cipher not initialized")
         if self._cipher_mode == CipherMode.ENCRYPT:
@@ -229,7 +232,7 @@ class _CipherWriter(_CipherIO):
 
     def open(self) -> None:
         """Initialize cipher and write header."""
-        self._open_for_encrypt(0)
+        self._open_for_encrypt(0)  # Size unknown at this point
         self._dest.write(self.securetar_header.to_bytes())
 
     def write(self, data: bytes) -> None:
