@@ -1,5 +1,6 @@
 """Test Tarfile functions."""
 
+from collections.abc import Callable, Hashable
 import gzip
 import io
 import os
@@ -241,15 +242,20 @@ def test_create_encrypted_tar(tmp_path: Path, bufsize: int) -> None:
 
 @patch("securetar.time.time", new=Mock(return_value=1765362043.0))
 @pytest.mark.parametrize(
-    ("create_cipher_context", "expect_same_content"),
-    [(False, False), (True, True)],
+    ("derived_key_id", "root_key_context_func", "password", "expect_same_content"),
+    [
+        (None, lambda: None, "hunter2", False),
+        ("inner_file", lambda: SecureTarRootKeyContext("hunter2"), None, True),
+    ],
 )
-def test_create_encrypted_archive_fixed_nonce(
-    tmp_path: Path, create_cipher_context: bool, expect_same_content: bool
+def test_encrypt_archive_fixed_nonce(
+    tmp_path: Path,
+    derived_key_id: Hashable | None,
+    root_key_context_func: Callable[[str | None], SecureTarRootKeyContext],
+    password: str | None,
+    expect_same_content: bool,
 ) -> None:
     """Test to create an archive with fixed nonce."""
-    password = "hunter2"
-
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
     fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
@@ -259,12 +265,7 @@ def test_create_encrypted_archive_fixed_nonce(
     with open(temp_orig / "randbytes2", "wb") as file:
         file.write(os.urandom(12345))
 
-    derived_key_id = None
-    root_key_context = None
-    if create_cipher_context:
-        derived_key_id = "inner_file"
-        root_key_context = SecureTarRootKeyContext(password)
-        password = None
+    root_key_context = root_key_context_func()
 
     # Create Archive 1
     temp_tar1 = tmp_path.joinpath("backup1.tar")
@@ -307,15 +308,20 @@ def test_create_encrypted_archive_fixed_nonce(
 
 @patch("securetar.time.time", new=Mock(return_value=1765362043.0))
 @pytest.mark.parametrize(
-    ("create_cipher_context", "expect_same_content"),
-    [(False, False), (True, True)],
+    ("derived_key_id", "root_key_context_func", "password", "expect_same_content"),
+    [
+        (None, lambda: None, "hunter2", False),
+        ("inner_file", lambda: SecureTarRootKeyContext("hunter2"), None, True),
+    ],
 )
 def test_encrypt_archive_fixed_nonce(
-    tmp_path: Path, create_cipher_context: bool, expect_same_content: bool
+    tmp_path: Path,
+    derived_key_id: Hashable | None,
+    root_key_context_func: Callable[[str | None], SecureTarRootKeyContext],
+    password: str | None,
+    expect_same_content: bool,
 ) -> None:
     """Test to encrypt a plaintext archive with fixed nonce."""
-    password = "hunter2"
-
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
     fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
@@ -339,12 +345,7 @@ def test_encrypt_archive_fixed_nonce(
                 arcname=".",
             )
 
-    derived_key_id = None
-    root_key_context = None
-    if create_cipher_context:
-        derived_key_id = "inner_file"
-        root_key_context = SecureTarRootKeyContext(password)
-        password = None
+    root_key_context = root_key_context_func()
 
     # Create encrypted archive 1
     temp_tar1 = tmp_path.joinpath("backup1.tar")

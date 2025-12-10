@@ -729,7 +729,7 @@ class SecureTarArchive:
         self._tar: tarfile.TarFile | None = None
 
         # Set up key context
-        self._root_key_context: SecureTarRootKeyContext = root_key_context
+        self._root_key_context = root_key_context
         if password:
             self._root_key_context = SecureTarRootKeyContext(password)
 
@@ -790,7 +790,7 @@ class SecureTarArchive:
             raise SecureTarError("create_inner_tar not supported in streaming mode")
         if derived_key_id is not None and self._root_key_context is None:
             raise ValueError(
-                "Cannot specify 'derived_key_id' when encryption is not enabled"
+                "Cannot specify 'derived_key_id' when encryption is disabled"
             )
 
         return _InnerSecureTarFile(
