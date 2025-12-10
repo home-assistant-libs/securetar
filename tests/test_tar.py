@@ -331,9 +331,7 @@ def test_encrypt_archive_fixed_nonce(
         temp_tar,
         "w",
     ) as archive:
-        with archive.create_tar(
-            "core.tar"
-        ) as inner_tar_file:
+        with archive.create_tar("core.tar") as inner_tar_file:
             atomic_contents_add(
                 inner_tar_file,
                 temp_orig,
@@ -350,34 +348,44 @@ def test_encrypt_archive_fixed_nonce(
 
     # Create encrypted archive 1
     temp_tar1 = tmp_path.joinpath("backup1.tar")
-    with SecureTarArchive(
-        temp_tar1,
-        "w",
-        password=password,
-        root_key_context=root_key_context,
-    ) as encrypted_archive, SecureTarArchive(
-        temp_tar,
-        "r",
-    ) as plaintext_archive:
+    with (
+        SecureTarArchive(
+            temp_tar1,
+            "w",
+            password=password,
+            root_key_context=root_key_context,
+        ) as encrypted_archive,
+        SecureTarArchive(
+            temp_tar,
+            "r",
+        ) as plaintext_archive,
+    ):
         for tar_info in plaintext_archive.tar:
             encrypted_archive.import_tar(
-                plaintext_archive.tar.extractfile(tar_info), tar_info, derived_key_id=derived_key_id
+                plaintext_archive.tar.extractfile(tar_info),
+                tar_info,
+                derived_key_id=derived_key_id,
             )
 
     # Create encrypted archive 2
     temp_tar2 = tmp_path.joinpath("backup2.tar")
-    with SecureTarArchive(
-        temp_tar2,
-        "w",
-        password=password,
-        root_key_context=root_key_context,
-    ) as encrypted_archive, SecureTarArchive(
-        temp_tar,
-        "r",
-    ) as plaintext_archive:
+    with (
+        SecureTarArchive(
+            temp_tar2,
+            "w",
+            password=password,
+            root_key_context=root_key_context,
+        ) as encrypted_archive,
+        SecureTarArchive(
+            temp_tar,
+            "r",
+        ) as plaintext_archive,
+    ):
         for tar_info in plaintext_archive.tar:
             encrypted_archive.import_tar(
-                plaintext_archive.tar.extractfile(tar_info), tar_info, derived_key_id=derived_key_id
+                plaintext_archive.tar.extractfile(tar_info),
+                tar_info,
+                derived_key_id=derived_key_id,
             )
 
     assert expect_same_content == (temp_tar1.read_bytes() == temp_tar2.read_bytes())
