@@ -809,12 +809,12 @@ class SecureTarArchive:
             ciphertext_size=member.size,
         )
 
-    def add_tar(
+    def import_tar(
         self,
         source: IO[bytes],
         member: tarfile.TarInfo,
     ) -> None:
-        """Add an existing tar to the archive, encrypting it.
+        """Import an existing tar into the archive, encrypting it.
 
         The tar_info.size must be set to the size of the source stream.
 
