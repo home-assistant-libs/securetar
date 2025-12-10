@@ -701,7 +701,7 @@ class SecureTarArchive:
             streaming: Whether to use streaming mode for tarfile (no seeking)
         """
         if name is None and fileobj is None:
-            raise ValueError("Either filename or fileobj must be provided")
+            raise ValueError("Either name or fileobj must be provided")
 
         if mode not in (MOD_EXCLUSIVE, MOD_READ, MOD_WRITE):
             raise ValueError(
