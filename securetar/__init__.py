@@ -341,7 +341,7 @@ class _FramedDecryptingReader(_FramedReader):
         return data[:-padding_len]
 
 
-class _SecureTarDecryptStream:
+class SecureTarDecryptStream:
     """Decrypts an encrypted tar read from a stream."""
 
     _cipher: _CipherReader
@@ -414,7 +414,7 @@ class _FramedEncryptingReader(_FramedReader):
         return data + self._source.finalize_padding()
 
 
-class _SecureTarEncryptStream:
+class SecureTarEncryptStream:
     """Encrypt a plaintext tar read from a stream."""
 
     _cipher: _CipherReader
@@ -685,7 +685,7 @@ class SecureTarFile:
         return round(self._name.stat().st_size / 1_048_576, 2)  # calc mbyte
 
 
-class _InnerSecureTarFile(SecureTarFile):
+class InnerSecureTarFile(SecureTarFile):
     """Handle encrypted files for tarfile library inside another tarfile."""
 
     _header_length: int
@@ -714,7 +714,6 @@ class _InnerSecureTarFile(SecureTarFile):
             root_key_context=root_key_context,
         )
         self.outer_tar = outer_tar
-        self.stream: Generator[BinaryIO, None, None] | None = None
 
     def __enter__(self) -> tarfile.TarFile:
         """Start context manager tarfile."""
@@ -886,7 +885,7 @@ class SecureTarArchive:
         *,
         derived_key_id: Hashable | None = None,
         gzip: bool = True,
-    ) -> _InnerSecureTarFile:
+    ) -> InnerSecureTarFile:
         """Create a new tar file within the archive.
 
         Returns a context manager that yields a TarFile for adding files.
@@ -902,13 +901,13 @@ class SecureTarArchive:
         if self._mode == MOD_READ:
             raise SecureTarError("Archive not open for writing")
         if self._streaming:
-            raise SecureTarError("create_inner_tar not supported in streaming mode")
+            raise SecureTarError("create_tar not supported in streaming mode")
         if derived_key_id is not None and self._root_key_context is None:
             raise ValueError(
                 "Cannot specify 'derived_key_id' when encryption is disabled"
             )
 
-        return _InnerSecureTarFile(
+        return InnerSecureTarFile(
             self._tar,
             bufsize=self._bufsize,
             gzip=gzip,
@@ -921,7 +920,7 @@ class SecureTarArchive:
     def extract_tar(
         self,
         member: tarfile.TarInfo,
-    ) -> _SecureTarDecryptStream:
+    ) -> SecureTarDecryptStream:
         """Extract and decrypt a tar file from the archive.
 
         Returns a context manager that yields a readable stream of decrypted bytes.
@@ -942,7 +941,7 @@ class SecureTarArchive:
         if fileobj is None:
             raise SecureTarError(f"Cannot extract {member.name}")
 
-        return _SecureTarDecryptStream(
+        return SecureTarDecryptStream(
             fileobj,
             ciphertext_size=member.size,
             root_key_context=self._root_key_context,
@@ -957,7 +956,7 @@ class SecureTarArchive:
     ) -> None:
         """Import an existing tar into the archive, encrypting it.
 
-        The tar_info.size must be set to the size of the source stream.
+        The member.size must be set to the size of the source stream.
 
         Args:
             source: Source tar stream to encrypt and add
@@ -973,7 +972,7 @@ class SecureTarArchive:
         if not self._root_key_context:
             raise SecureTarError("No password provided")
 
-        with _SecureTarEncryptStream(
+        with SecureTarEncryptStream(
             source,
             derived_key_id=derived_key_id,
             plaintext_size=member.size,
