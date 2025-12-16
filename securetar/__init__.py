@@ -37,10 +37,18 @@ DEFAULT_BUFSIZE = 10240
 SECURETAR_MAGIC = b"SecureTar"
 SECURETAR_MAGIC_RESERVED = b"\x00" * 6  # To be used for flags in future versions
 
+# SecureTar v1 header consists of:
+# 0 bytes file ID (no magic)
+# 16 bytes AES IV
 SECURETAR_V1_FILE_ID_SIZE = 0
 SECURETAR_V1_CIPHER_INIT_SIZE = AES_IV_SIZE
 SECURETAR_V1_HEADER_SIZE = SECURETAR_V1_FILE_ID_SIZE + SECURETAR_V1_CIPHER_INIT_SIZE
 
+# SecureTar v2 header consists of:
+# 32 bytes file ID:
+#  - 16 bytes magic + version + reserved
+#  - 8 bytes plaintext size + 8 bytes reserved
+# 16 bytes AES IV
 SECURETAR_V2_FILE_ID_SIZE = (
     len(SECURETAR_MAGIC) + 1 + len(SECURETAR_MAGIC_RESERVED) + 16
 )
@@ -90,18 +98,20 @@ class SecureTarHeader:
     @classmethod
     def from_bytes(cls, f: IO[bytes]) -> SecureTarHeader:
         """Create from bytes."""
-        # Read magic, version, reserved
+        # Read magic, version (1 byte), reserved
         header = f.read(len(SECURETAR_MAGIC) + 1 + len(SECURETAR_MAGIC_RESERVED))
         plaintext_size: int | None = None
         if (
             header[0:9] != SECURETAR_MAGIC
-            or header[9] != 2
+            # Check major version at offset 9
+            or header[9] not in (2, 3)
             or header[10:16] != SECURETAR_MAGIC_RESERVED
         ):
             # Assume legacy format without magic
             cipher_initialization = header
             version = 1
         else:
+            # Valid SecureTar v2+ header, read rest of header: plaintext size + reserved
             plaintext_size = int.from_bytes(f.read(8), "big")
             version = header[9]
             f.read(8)  # Skip reserved bytes
@@ -113,6 +123,9 @@ class SecureTarHeader:
         """Return header bytes."""
         if self.plaintext_size is None:
             raise ValueError("Plaintext size is required")
+        # Check version.
+        # SecureTar versions writing v1 had bugs related to how the padding was
+        # handled, and we don't support such archives anymore.
         if self.version != 2:
             raise ValueError(f"Unsupported SecureTar version: {self.version}")
 
@@ -165,11 +178,11 @@ class CipherReader(CipherStream):
     """Abstract base for cipher readers with buffered read."""
 
     def __init__(self, source: IO[bytes], ciphertext_size: int | None = None) -> None:
+        """Initialize cipher reader."""
         self._buffer = b""
         self._ciphertext_size = ciphertext_size
         self._done = False
         self._source = source
-        """Initialize cipher reader."""
 
     def read(self, size: int = 0) -> bytes:
         """Read data from buffer, filling as needed."""
