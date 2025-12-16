@@ -36,7 +36,7 @@ DEFAULT_BUFSIZE = 10240
 # The initial header consists of 16 bytes of magic, version, reserved.
 # The 16 bytes size is chosen to align with v1 which has no magic, just 16 byte AES IV.
 SECURETAR_MAGIC = b"SecureTar"
-SECURETAR_MAGIC_RESERVED = b"\x00" * 6  # To be used for flags in future versions
+SECURETAR_MAGIC_RESERVED = b"\x00" * 6
 
 # SecureTar v1 header consists of:
 # 0 bytes file ID (no magic)
@@ -46,7 +46,7 @@ SECURETAR_V1_CIPHER_INIT_SIZE = AES_IV_SIZE
 SECURETAR_V1_HEADER_SIZE = SECURETAR_V1_FILE_ID_SIZE + SECURETAR_V1_CIPHER_INIT_SIZE
 
 # SecureTar v2 header consists of:
-# 16 bytes file ID: 9 byte magic + version + 6 bytes reserved
+# 16 bytes file ID: 9 bytes magic + 1 byte version + 6 bytes reserved
 # 16 bytes file metadata: 8 bytes plaintext size + 8 bytes reserved
 # 16 bytes AES IV
 SECURETAR_V2_FILE_ID_FORMAT = "!9sB6s"
@@ -58,16 +58,6 @@ SECURETAR_V2_HEADER_SIZE = (
     + SECURETAR_V2_CIPHER_INIT_SIZE
 )
 
-# SecureTar v2 header consists of:
-# 32 bytes file ID:
-#  - 16 bytes magic + version + reserved
-#  - 8 bytes plaintext size + 8 bytes reserved
-# 16 bytes AES IV
-SECURETAR_V2_FILE_ID_SIZE = (
-    len(SECURETAR_MAGIC) + 1 + len(SECURETAR_MAGIC_RESERVED) + 16
-)
-SECURETAR_V2_CIPHER_INIT_SIZE = AES_IV_SIZE
-SECURETAR_V2_HEADER_SIZE = SECURETAR_V2_FILE_ID_SIZE + SECURETAR_V2_CIPHER_INIT_SIZE
 
 GZIP_MAGIC_BYTES = b"\x1f\x8b\x08"
 TAR_MAGIC_BYTES = b"ustar"
