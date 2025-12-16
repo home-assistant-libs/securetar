@@ -60,24 +60,26 @@ SECURETAR_MAGIC_RESERVED = b"\x00" * 6
 
 # SecureTar v1 header consists of:
 # 0 bytes file ID (no magic)
+# 0 bytes file metadata (no metadata)
 # 16 bytes AES IV
-SECURETAR_V1_FILE_ID_SIZE = 0
-SECURETAR_V1_CIPHER_INIT_SIZE = AES_IV_SIZE
-SECURETAR_V1_HEADER_SIZE = SECURETAR_V1_FILE_ID_SIZE + SECURETAR_V1_CIPHER_INIT_SIZE
+SECURETAR_LEGACY_HEADER_SIZE = AES_IV_SIZE
 
-# SecureTar v2 header consists of:
+# Securetar file ID and metadata formats used in v2 and v3:
 # 16 bytes file ID: 9 bytes magic + 1 byte version + 6 bytes reserved
 # 16 bytes file metadata: 8 bytes plaintext size + 8 bytes reserved
+SECURETAR_FILE_ID_FORMAT = "!9sB6s"
+SECURETAR_FILE_METADATA_FORMAT = "!Q8x"
+
+# SecureTar v2 header consists of:
+# 32 bytes file ID + metadata
 # 16 bytes AES IV
 # Note: The reserved bytes are currently unused and written as \x00. The reserved
 # bytes in the file ID must be zero when reading. The reserved bytes in the file
 # metadata are ignored when reading.
-SECURETAR_V2_FILE_ID_FORMAT = "!9sB6s"
-SECURETAR_V2_FILE_METADATA_FORMAT = "!Q8x"
 SECURETAR_V2_CIPHER_INIT_SIZE = AES_IV_SIZE
 SECURETAR_V2_HEADER_SIZE = (
-    struct.calcsize(SECURETAR_V2_FILE_ID_FORMAT)
-    + struct.calcsize(SECURETAR_V2_FILE_METADATA_FORMAT)
+    struct.calcsize(SECURETAR_FILE_ID_FORMAT)
+    + struct.calcsize(SECURETAR_FILE_METADATA_FORMAT)
     + SECURETAR_V2_CIPHER_INIT_SIZE
 )
 
@@ -99,8 +101,8 @@ SECURETAR_V3_CIPHER_INIT_FORMAT = (
 )
 SECURETAR_V3_CIPHER_INIT_SIZE = struct.calcsize(SECURETAR_V3_CIPHER_INIT_FORMAT)
 SECURETAR_V3_HEADER_SIZE = (
-    struct.calcsize(SECURETAR_V2_FILE_ID_FORMAT)
-    + struct.calcsize(SECURETAR_V2_FILE_METADATA_FORMAT)
+    struct.calcsize(SECURETAR_FILE_ID_FORMAT)
+    + struct.calcsize(SECURETAR_FILE_METADATA_FORMAT)
     + SECURETAR_V3_CIPHER_INIT_SIZE
 )
 
@@ -142,7 +144,7 @@ class SecureTarHeader:
         self.version = version
 
         if version == 1:
-            self.size = SECURETAR_V1_HEADER_SIZE
+            self.size = SECURETAR_LEGACY_HEADER_SIZE
         elif version == 2:
             self.size = SECURETAR_V2_HEADER_SIZE
         else:
@@ -152,9 +154,9 @@ class SecureTarHeader:
     def from_bytes(cls, f: IO[bytes]) -> SecureTarHeader:
         """Create from bytes."""
         # Read magic, version (1 byte), reserved
-        header = f.read(struct.calcsize(SECURETAR_V2_FILE_ID_FORMAT))
+        header = f.read(struct.calcsize(SECURETAR_FILE_ID_FORMAT))
         plaintext_size: int | None = None
-        magic, version, reserved = struct.unpack(SECURETAR_V2_FILE_ID_FORMAT, header)
+        magic, version, reserved = struct.unpack(SECURETAR_FILE_ID_FORMAT, header)
         if (
             magic != SECURETAR_MAGIC
             or version not in (2, 3)
@@ -164,10 +166,10 @@ class SecureTarHeader:
             cipher_initialization = header
             version = 1
         else:
-            file_metadata = f.read(struct.calcsize(SECURETAR_V2_FILE_METADATA_FORMAT))
+            file_metadata = f.read(struct.calcsize(SECURETAR_FILE_METADATA_FORMAT))
             # Valid SecureTar v2+ header, read rest of header: plaintext size + reserved
             (plaintext_size,) = struct.unpack(
-                SECURETAR_V2_FILE_METADATA_FORMAT, file_metadata
+                SECURETAR_FILE_METADATA_FORMAT, file_metadata
             )
             if version == 2:
                 cipher_initialization = f.read(SECURETAR_V2_CIPHER_INIT_SIZE)
@@ -188,12 +190,12 @@ class SecureTarHeader:
 
         return (
             struct.pack(
-                SECURETAR_V2_FILE_ID_FORMAT,
+                SECURETAR_FILE_ID_FORMAT,
                 SECURETAR_MAGIC,
                 self.version,
                 SECURETAR_MAGIC_RESERVED,
             )
-            + struct.pack(SECURETAR_V2_FILE_METADATA_FORMAT, self.plaintext_size)
+            + struct.pack(SECURETAR_FILE_METADATA_FORMAT, self.plaintext_size)
             + self.cipher_initialization
         )
 
