@@ -830,6 +830,8 @@ def test_encrypted_tar_inside_tar(
         for tar_info in outer_secure_tar_archive.tar:
             inner_tar = outer_secure_tar_archive.tar.extractfile(tar_info)
             assert inner_tar.read(len(SECURETAR_MAGIC)) == SECURETAR_MAGIC
+            # Skip version and reserved bytes
+            inner_tar.read(7)
             file_sizes[tar_info.name] = int.from_bytes(inner_tar.read(8), "big")
     assert set(file_sizes) == {*inner_tar_files}
 
@@ -1000,7 +1002,7 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
     with (
         # The fixture was created when passing a key directly, so we mock the key
         patch(
-            "securetar.SecureTarRootKeyContext._password_to_key",
+            "securetar.KeyDerivationV2._password_to_key",
             return_value=b"0123456789abcdef",
         ),
         SecureTarArchive(
