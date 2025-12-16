@@ -49,6 +49,9 @@ SECURETAR_V1_HEADER_SIZE = SECURETAR_V1_FILE_ID_SIZE + SECURETAR_V1_CIPHER_INIT_
 # 16 bytes file ID: 9 bytes magic + 1 byte version + 6 bytes reserved
 # 16 bytes file metadata: 8 bytes plaintext size + 8 bytes reserved
 # 16 bytes AES IV
+# Note: The reserved bytes are currently unused and written as \x00. The reserved
+# bytes in the file ID must be zero when reading. The reserved bytes in the file
+# metadata are ignored when reading.
 SECURETAR_V2_FILE_ID_FORMAT = "!9sB6s"
 SECURETAR_V2_FILE_METADATA_FORMAT = "!Q8x"
 SECURETAR_V2_CIPHER_INIT_SIZE = AES_IV_SIZE
