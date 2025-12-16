@@ -149,7 +149,7 @@ class SecureTarHeader:
                 SECURETAR_V2_FILE_ID_FORMAT,
                 SECURETAR_MAGIC,
                 self.version,
-                SECURETAR_MAGIC_RESERVED
+                SECURETAR_MAGIC_RESERVED,
             )
             + struct.pack(SECURETAR_V2_FILE_METADATA_FORMAT, self.plaintext_size)
             + self.cipher_initialization
