@@ -28,13 +28,10 @@ from securetar import (
 )
 
 
-
 @pytest.fixture(autouse=True)
 def decrease_chunk_size() -> Generator[None]:
     """Speed up tests by reducing Argon2 parameters."""
-    with patch(
-        "securetar.V3_SECRETSTREAM_CHUNK_SIZE", new=2048
-    ):
+    with patch("securetar.V3_SECRETSTREAM_CHUNK_SIZE", new=2048):
         yield
 
 

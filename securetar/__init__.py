@@ -36,6 +36,7 @@ from nacl.pwhash.argon2id import (
     MEMLIMIT_INTERACTIVE,
     SALTBYTES as ARGON2_SALT_SIZE,
 )
+from nacl.utils import random as nacl_random
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -1420,7 +1421,7 @@ class KeyDerivationV2(KeyDerivationStrategy):
         salt = (
             cipher_initialization
             if cipher_initialization is not None
-            else os.urandom(AES_IV_SIZE)
+            else nacl_random(AES_IV_SIZE)
         )
         return SecureTarDerivedKeyMaterialV2(root_key=self._root_key, salt=salt)
 
@@ -1446,8 +1447,8 @@ class KeyDerivationV3(KeyDerivationStrategy):
     @classmethod
     def create(cls, password: str) -> KeyDerivationV3:
         """Create strategy for new files."""
-        root_salt = os.urandom(ARGON2_SALT_SIZE)
-        validation_salt = os.urandom(V3_DERIVED_KEY_SALT_SIZE)
+        root_salt = nacl_random(ARGON2_SALT_SIZE)
+        validation_salt = nacl_random(V3_DERIVED_KEY_SALT_SIZE)
         root_key, validation_key = cls._derive_keys(
             password, root_salt, validation_salt
         )
@@ -1500,7 +1501,7 @@ class KeyDerivationV3(KeyDerivationStrategy):
                 SECURETAR_V3_CIPHER_INIT_FORMAT, cipher_initialization
             )
         else:
-            derivation_salt = os.urandom(V3_DERIVED_KEY_SALT_SIZE)
+            derivation_salt = nacl_random(V3_DERIVED_KEY_SALT_SIZE)
             secretstream_header = None  # Will be generated
 
         return SecureTarDerivedKeyMaterialV3(
