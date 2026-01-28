@@ -1188,6 +1188,21 @@ def test_outer_tar_exclusive_mode(tmp_path: Path) -> None:
     ("params", "expected_exception", "expected_message"),
     [
         (
+            {"create_version": 1},
+            ValueError,
+            "Version must be None when reading a SecureTar file",
+        ),
+        (
+            {"create_version": 1, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 1",
+        ),
+        (
+            {"create_version": 4, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 4",
+        ),
+        (
             {"password": "hunter2", "root_key_context": SecureTarRootKeyContext("abc")},
             ValueError,
             "Cannot specify both 'root_key_context' and 'password'",
@@ -1374,6 +1389,21 @@ def test_securetararchive_validate_password_unencrypted(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("params", "expected_exception", "expected_message"),
     [
+        (
+            {"create_version": 1},
+            ValueError,
+            "Version must be None when reading a SecureTar file",
+        ),
+        (
+            {"create_version": 1, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 1",
+        ),
+        (
+            {"create_version": 4, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 4",
+        ),
         (
             {"derived_key_id": "123"},
             ValueError,
