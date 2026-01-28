@@ -1,6 +1,6 @@
 """Test Tarfile functions."""
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Generator, Hashable
 import gzip
 import io
 import os
@@ -26,6 +26,16 @@ from securetar import (
     atomic_contents_add,
     secure_path,
 )
+
+
+
+@pytest.fixture(autouse=True)
+def decrease_chunk_size() -> Generator[None]:
+    """Speed up tests by reducing Argon2 parameters."""
+    with patch(
+        "securetar.V3_SECRETSTREAM_CHUNK_SIZE", new=2048
+    ):
+        yield
 
 
 @dataclass
