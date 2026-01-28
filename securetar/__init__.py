@@ -82,7 +82,7 @@ SECURETAR_V2_HEADER_SIZE = (
 )
 
 # SecureTar v3 header consists of:
-# 16 bytes file ID: 9 byte magic + version + 6 bytes reserved
+# 16 bytes file ID: 9 bytes magic + 1 byte version + 6 bytes reserved
 # 16 bytes file metadata: 8 bytes plaintext size + 8 bytes reserved
 # 104 bytes cipher initialization:
 #  - 16 bytes root salt
@@ -92,9 +92,9 @@ SECURETAR_V2_HEADER_SIZE = (
 #  - 24 bytes cipher header + nonce
 SECURETAR_V3_CIPHER_INIT_FORMAT = (
     f"!{ARGON2_SALT_SIZE}s"  # Root salt
-    f"{V3_DERIVED_KEY_SALT_SIZE}s"  # Validation salt
+    f"{V3_DERIVED_KEY_SALT_SIZE}s"  # Validation key salt
     f"{V3_DERIVED_KEY_SIZE}s"  # Validation derived key
-    f"{V3_DERIVED_KEY_SALT_SIZE}s"  # Derivation salt
+    f"{V3_DERIVED_KEY_SALT_SIZE}s"  # Secret stream key salt
     f"{V3_CHACHA20_HEADER_SIZE}s"  # Cipher header + nonce (24 bytes)
 )
 SECURETAR_V3_CIPHER_INIT_SIZE = struct.calcsize(SECURETAR_V3_CIPHER_INIT_FORMAT)
