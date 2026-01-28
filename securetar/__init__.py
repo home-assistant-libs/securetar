@@ -714,22 +714,21 @@ class InnerSecureTarFile(SecureTarFile):
             root_key_context=root_key_context,
         )
         self.outer_tar = outer_tar
+        if self.outer_tar.format != tarfile.PAX_FORMAT:
+            raise ValueError("Outer tarfile must be in PAX format")
 
     def __enter__(self) -> tarfile.TarFile:
         """Start context manager tarfile."""
         self._tar_info = tarfile.TarInfo(name=str(self._name))
-        if self.outer_tar.format == tarfile.PAX_FORMAT:
-            # Ensure we always set mtime as a float to force
-            # a PAX header to be written.
-            #
-            # This is necessary to
-            # handle large files as TarInfo.tobuf will try to
-            # use a shorter ustar header if we do not have at
-            # least one float in the tarinfo.
-            # https://github.com/python/cpython/blob/53b84e772cac6e4a55cebf908d6bb9c48fe254dc/Lib/tarfile.py#L1066
-            self._tar_info.mtime = time.time()
-        else:
-            self._tar_info.mtime = int(time.time())
+        # Ensure we always set mtime as a float to force
+        # a PAX header to be written.
+        #
+        # This is necessary to
+        # handle large files as TarInfo.tobuf will try to
+        # use a shorter ustar header if we do not have at
+        # least one float in the tarinfo.
+        # https://github.com/python/cpython/blob/53b84e772cac6e4a55cebf908d6bb9c48fe254dc/Lib/tarfile.py#L1066
+        self._tar_info.mtime = time.time()
 
         fileobj = self.outer_tar.fileobj
         if fileobj is None:

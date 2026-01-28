@@ -1,6 +1,7 @@
 """Test Tarfile functions."""
 
 from collections.abc import Callable, Hashable
+from contextlib import AbstractContextManager, nullcontext as does_not_raise
 import gzip
 import io
 import os
@@ -17,6 +18,7 @@ import pytest
 from securetar import (
     SECURETAR_MAGIC,
     AddFileError,
+    InnerSecureTarFile,
     SecureTarArchive,
     SecureTarError,
     SecureTarFile,
@@ -592,6 +594,65 @@ def test_tar_inside_tar(
             "775",
         ]
         assert temp_inner_new.joinpath("README.md").is_file()
+
+
+@pytest.mark.parametrize(
+    ("outer_tar_header_format", "expected_result"),
+    [
+        (
+            tarfile.PAX_FORMAT,
+            does_not_raise(),
+        ),
+        (
+            tarfile.GNU_FORMAT,
+            pytest.raises(ValueError, match="Outer tarfile must be in PAX format"),
+        ),
+        (
+            tarfile.USTAR_FORMAT,
+            pytest.raises(ValueError, match="Outer tarfile must be in PAX format"),
+        ),
+    ],
+)
+def test_inner_tar_header_format(
+    tmp_path: Path,
+    outer_tar_header_format: str,
+    expected_result: AbstractContextManager[None],
+) -> None:
+    """Test inner tar with different outer tar header formats."""
+    # Create Tarfile
+    main_tar = tmp_path.joinpath("backup.tar")
+    with tarfile.TarFile(
+        main_tar, "w", format=outer_tar_header_format
+    ) as outer_tar_file:
+        with expected_result:
+            InnerSecureTarFile(
+                outer_tar_file,
+                bufsize=10240,
+                gzip=False,
+                mode="w",
+                name=Path("inner.tar"),
+                derived_key_id=None,
+                root_key_context=None,
+            )
+
+
+def test_inner_tar_force_pax_header(tmp_path: Path) -> None:
+    """Test inner tar forces PAX header format."""
+    # Create Tarfile
+    main_tar = tmp_path.joinpath("backup.tar")
+    with tarfile.TarFile(main_tar, "w", format=tarfile.PAX_FORMAT) as outer_tar_file:
+        inner_tar = InnerSecureTarFile(
+            outer_tar_file,
+            bufsize=10240,
+            gzip=False,
+            mode="w",
+            name=Path("inner.tar"),
+            derived_key_id=None,
+            root_key_context=None,
+        )
+        with inner_tar as inner_tar_file:
+            assert inner_tar_file.format == tarfile.PAX_FORMAT
+            assert type(inner_tar._tar_info.mtime) is float
 
 
 @pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
