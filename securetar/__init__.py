@@ -30,12 +30,7 @@ from nacl.bindings.crypto_secretstream import (
 )
 import nacl.encoding
 from nacl.hash import blake2b
-from nacl.pwhash.argon2id import (
-    kdf,
-    OPSLIMIT_INTERACTIVE,
-    MEMLIMIT_INTERACTIVE,
-    SALTBYTES as ARGON2_SALT_SIZE,
-)
+from nacl.pwhash.argon2id import kdf, SALTBYTES as ARGON2_SALT_SIZE
 from nacl.utils import random as nacl_random
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -48,6 +43,8 @@ AES_IV_SIZE = AES_BLOCK_SIZE
 # Sizes for v3
 V3_SECRETSTREAM_ABYTES = nss.crypto_secretstream_xchacha20poly1305_ABYTES
 V3_SECRETSTREAM_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+V3_KDF_OPSLIMIT = 8
+V3_KDF_MEMLIMIT = 16 * 1024 * 1024  # 16 MiB
 V3_DERIVED_KEY_SIZE = 32
 V3_DERIVED_KEY_SALT_SIZE = 16
 V3_CHACHA20_HEADER_SIZE = nss.crypto_secretstream_xchacha20poly1305_HEADERBYTES
@@ -1479,9 +1476,8 @@ class KeyDerivationV3(KeyDerivationStrategy):
             nss.crypto_secretstream_xchacha20poly1305_KEYBYTES,
             password.encode(),
             root_salt,
-            # Note: These will be changed to MODERATE or SENSITIVE
-            opslimit=OPSLIMIT_INTERACTIVE,
-            memlimit=MEMLIMIT_INTERACTIVE,
+            opslimit=V3_KDF_OPSLIMIT,
+            memlimit=V3_KDF_MEMLIMIT,
         )
         validation_key = blake2b(
             b"",
