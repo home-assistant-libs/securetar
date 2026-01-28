@@ -730,8 +730,6 @@ class InnerSecureTarFile(SecureTarFile):
             self._tar_info.mtime = int(time.time())
 
         fileobj = self.outer_tar.fileobj
-        if fileobj is None:
-            raise ValueError("Outer tar file has no fileobj")
 
         self._header_position = fileobj.tell()
 
@@ -756,8 +754,6 @@ class InnerSecureTarFile(SecureTarFile):
         """Update tar header and securetar header with final sizes."""
         outer_tar = self.outer_tar
         fileobj = self.outer_tar.fileobj
-        if fileobj is None:
-            raise ValueError("Outer tar file has no fileobj")
 
         end_position = fileobj.tell()
 
