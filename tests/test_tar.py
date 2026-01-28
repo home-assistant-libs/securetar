@@ -55,9 +55,33 @@ def test_not_secure_path() -> None:
     assert [] == list(secure_path(test_list))
 
 
-def test_file_filter(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("file_filter", "expected_filter_calls", "expected_tar_items"),
+    [
+        (
+            Mock(return_value=False),
+            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
+            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
+        ),
+        (
+            Mock(return_value=True),
+            {"."},
+            set(),
+        ),
+        (
+            Mock(wraps=lambda path: path.name == "README.md"),
+            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
+            {".", "test_symlink", "test1", "test1/script.sh"},
+        ),
+    ],
+)
+def test_file_filter(
+    tmp_path: Path,
+    file_filter: Mock,
+    expected_filter_calls: set[str],
+    expected_tar_items: set[str],
+) -> None:
     """Test exclude filter."""
-    file_filter = Mock(return_value=False)
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
     fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
@@ -73,15 +97,12 @@ def test_file_filter(tmp_path: Path) -> None:
             arcname=".",
         )
     paths = [call[1][0] for call in file_filter.mock_calls]
-    expected_paths = {
-        PurePath("."),
-        PurePath("README.md"),
-        PurePath("test_symlink"),
-        PurePath("test1"),
-        PurePath("test1/script.sh"),
-    }
-    assert len(paths) == len(expected_paths)
-    assert set(paths) == expected_paths
+    assert len(paths) == len(expected_filter_calls)
+    assert set(paths) == {PurePath(path) for path in expected_filter_calls}
+
+    with SecureTarFile(temp_tar, "r") as tar_file:
+        members = {tar_info.name for tar_info in tar_file}
+    assert members == expected_tar_items
 
 
 @pytest.mark.parametrize("bufsize", [10240, 4 * 2**20])
@@ -1060,28 +1081,6 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
             }
 
 
-def test_inner_tar_not_allowed_in_streaming(tmp_path: Path) -> None:
-    # Create Tarfile
-    main_tar = tmp_path.joinpath("backup.tar")
-
-    outer_secure_tar_archive = SecureTarArchive(main_tar, "w", streaming=True)
-
-    with pytest.raises(SecureTarError):
-        with outer_secure_tar_archive:
-            with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
-                pass
-
-
-def test_outer_tar_must_be_open(tmp_path: Path) -> None:
-    # Create Tarfile
-    main_tar = tmp_path.joinpath("backup.tar")
-    outer_secure_tar_archive = SecureTarArchive(main_tar, "w")
-
-    with pytest.raises(SecureTarError):
-        with outer_secure_tar_archive.create_tar("any.tgz", gzip=True):
-            pass
-
-
 def test_outer_tar_open_close(tmp_path: Path) -> None:
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
@@ -1127,3 +1126,283 @@ def test_outer_tar_exclusive_mode(tmp_path: Path) -> None:
     outer_secure_tar_file = SecureTarFile(main_tar, "x", gzip=False)
     with pytest.raises(FileExistsError):
         outer_secure_tar_file.open()
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_exception", "expected_message"),
+    [
+        (
+            {"password": "hunter2", "root_key_context": SecureTarRootKeyContext("abc")},
+            ValueError,
+            "Cannot specify both 'root_key_context' and 'password'",
+        ),
+        (
+            {},
+            ValueError,
+            "Either name or fileobj must be provided",
+        ),
+        (
+            {"name": "test.tar", "mode": "invalid_mode"},
+            ValueError,
+            "Mode must be 'x', 'r', or 'w'",
+        ),
+    ],
+)
+def test_securetararchive_error_handling(
+    params: dict[str, Any],
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    """Test SecureTarArchive constructor error handling."""
+    with pytest.raises(expected_exception, match=expected_message):
+        SecureTarArchive(**params)
+
+
+def test_securetararchive_tar_before_open() -> None:
+    """Test SecureTarArchive.tar access before open."""
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="r")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.tar
+
+
+def test_securetararchive_create_inner_tar_before_open() -> None:
+    """Test SecureTarArchive.create_tar call before open."""
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.create_tar("any.tgz")
+
+
+def test_securetararchive_create_inner_tar_read_mode() -> None:
+    """Test SecureTarArchive.create_tar in read mode."""
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with secure_tar_archive:
+        pass
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="r")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="Archive not open for writing"):
+            secure_tar_archive.create_tar("any.tgz")
+
+
+def test_securetararchive_create_inner_tar_streaming(tmp_path: Path) -> None:
+    """Test SecureTarArchive.create_tar in streaming mode."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w", streaming=True)
+    with secure_tar_archive:
+        with pytest.raises(
+            SecureTarError, match="create_tar not supported in streaming mode"
+        ):
+            secure_tar_archive.create_tar("any.tgz")
+
+
+def test_securetararchive_create_inner_tar_derived_key_unencrypted(
+    tmp_path: Path,
+) -> None:
+    """Test SecureTarArchive.create_tar specify derived key without encryption."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w")
+    with secure_tar_archive:
+        with pytest.raises(
+            ValueError,
+            match="Cannot specify 'derived_key_id' when encryption is disabled",
+        ):
+            secure_tar_archive.create_tar("any.tgz", derived_key_id="123")
+
+
+def test_securetararchive_extract_inner_tar_before_open() -> None:
+    """Test SecureTarArchive.extract_tar call before open."""
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.extract_tar(tarfile.TarInfo("blah"))
+
+
+def test_securetararchive_extract_inner_tar_write_mode() -> None:
+    """Test SecureTarArchive.extract_tar in write mode."""
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="Archive not open for reading"):
+            secure_tar_archive.extract_tar(tarfile.TarInfo("blah"))
+
+
+def test_securetararchive_extract_inner_tar_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarArchive.extract_tar without encryption."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w")
+    with secure_tar_archive:
+        pass
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="r")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="No password provided"):
+            secure_tar_archive.extract_tar(tarfile.TarInfo("blah"))
+
+
+def test_securetararchive_extract_non_regular_inner_tar(tmp_path: Path) -> None:
+    """Test SecureTarArchive.extract_tar with unknown inner tar."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w", password="hunter2")
+    tarinfo = tarfile.TarInfo("blah")
+    tarinfo.type = tarfile.DIRTYPE
+    with secure_tar_archive:
+        secure_tar_archive.tar.addfile(tarinfo)
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="r", password="hunter2")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="Cannot extract blah"):
+            secure_tar_archive.extract_tar(tarinfo)
+
+
+def test_securetararchive_import_tar_before_open() -> None:
+    """Test SecureTarArchive.import_tar call before open."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.import_tar(Mock(), tarinfo)
+
+
+def test_securetararchive_import_tar_read_mode() -> None:
+    """Test SecureTarArchive.import_tar in read mode."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with secure_tar_archive:
+        pass
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="r")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="Archive not open for writing"):
+            secure_tar_archive.import_tar(Mock(), tarinfo)
+
+
+def test_securetararchive_import_tar_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarArchive.import_tar specify derived key without encryption."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="No password provided"):
+            secure_tar_archive.import_tar(Mock(), tarinfo)
+
+
+def test_securetararchive_validate_password_before_open() -> None:
+    """Test SecureTarArchive.validate_password call before open."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.validate_password(tarinfo)
+
+
+def test_securetararchive_validate_password_write_mode() -> None:
+    """Test SecureTarArchive.validate_password in write mode."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="Archive not open for reading"):
+            secure_tar_archive.validate_password(tarinfo)
+
+
+def test_securetararchive_validate_password_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarArchive.validate_password specify derived key without encryption."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w")
+    with secure_tar_archive:
+        pass
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="r")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="No password provided"):
+            secure_tar_archive.validate_password(tarinfo)
+
+
+@pytest.mark.parametrize(
+    ("params", "expected_exception", "expected_message"),
+    [
+        (
+            {"derived_key_id": "123"},
+            ValueError,
+            "Cannot specify 'derived_key_id' without 'root_key_context'",
+        ),
+        (
+            {"password": "hunter2", "root_key_context": SecureTarRootKeyContext("abc")},
+            ValueError,
+            "Cannot specify both 'root_key_context' and 'password'",
+        ),
+        (
+            {},
+            ValueError,
+            "Either filename or fileobj must be provided",
+        ),
+        (
+            {"name": "test.tar", "mode": "invalid_mode"},
+            ValueError,
+            "Mode must be 'x', 'r', or 'w'",
+        ),
+    ],
+)
+def test_securetarfile_error_handling(
+    params: dict[str, Any],
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    """Test SecureTarFile constructor error handling."""
+    with pytest.raises(expected_exception, match=expected_message):
+        SecureTarFile(**params)
+
+
+def test_securetarfile_validate_password_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarFile.validate_password specify derived key without encryption."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_file = SecureTarFile(name=main_tar, mode="w")
+    with secure_tar_file:
+        pass
+    secure_tar_file = SecureTarFile(name=main_tar, mode="r")
+    with secure_tar_file:
+        with pytest.raises(SecureTarError, match="File is not encrypted"):
+            secure_tar_file.validate_password()
+
+
+def test_securetarfile_validate_password_write_mode() -> None:
+    """Test SecureTarFile.validate_password in write mode."""
+    secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="w", password="hunter2")
+    with secure_tar_file:
+        with pytest.raises(
+            SecureTarError, match="Can only validate password in read mode"
+        ):
+            secure_tar_file.validate_password()
+
+
+def test_securetarfile_validate_password_after_open(tmp_path: Path) -> None:
+    """Test SecureTarFile.validate_password call after open."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_file = SecureTarFile(name=main_tar, mode="w", password="hunter2")
+    with secure_tar_file:
+        pass
+    secure_tar_file = SecureTarFile(name=main_tar, mode="r", password="hunter2")
+    with secure_tar_file:
+        with pytest.raises(SecureTarError, match="File is already open"):
+            secure_tar_file.validate_password()
+
+
+def test_securetarfile_path_fileobj() -> None:
+    """Test SecureTarFile.path property when fileobj is used."""
+    secure_tar_file = SecureTarFile(fileobj=io.BytesIO(), mode="r")
+    assert secure_tar_file.path is None
+
+
+def test_securetarfile_path_name() -> None:
+    """Test SecureTarFile.path property when name is used."""
+    secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="r")
+    assert secure_tar_file.path == Path("test.tar")
+
+
+def test_securetarfile_size_fileobj() -> None:
+    """Test SecureTarFile.size property when fileobj is used."""
+    secure_tar_file = SecureTarFile(fileobj=io.BytesIO(), mode="r")
+    assert secure_tar_file.size == 0
+
+
+def test_securetarfile_size_name() -> None:
+    """Test SecureTarFile.size property when name is used."""
+    secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="r")
+    assert secure_tar_file.size == 0.01
