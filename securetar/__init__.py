@@ -732,8 +732,6 @@ class InnerSecureTarFile(SecureTarFile):
             self._tar_info.mtime = int(time.time())
 
         fileobj = self.outer_tar.fileobj
-        if fileobj is None:
-            raise ValueError("Outer tar file has no fileobj")
 
         self._header_position = fileobj.tell()
 
