@@ -557,6 +557,18 @@ class _SecretStreamDecryptReader(DecryptReader):
             )
             self._buffer += plaintext
 
+            if self._ciphertext_size is not None:
+                remaining = self._ciphertext_size - self._pos
+                if tag == NSS_TAG_FINAL and remaining != 0:
+                    raise SecureTarReadError(
+                        "Unexpected final tag in secretstream decryption"
+                    )
+                if remaining == 0 and tag != NSS_TAG_FINAL:
+                    raise SecureTarReadError(
+                        "Missing final tag in secretstream decryption"
+                    )
+            if self._done and tag != NSS_TAG_FINAL:
+                raise SecureTarReadError("Missing final tag in secretstream decryption")
             if tag == NSS_TAG_FINAL:
                 self._done = True
 
