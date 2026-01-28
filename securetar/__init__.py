@@ -495,14 +495,12 @@ class SecureTarFile:
             exclusive with password.
         """
 
-        if (
-            derived_key_id is not None or root_key_context is not None
-        ) and password is not None:
-            raise ValueError("Cannot specify both 'derived_key_id' and 'password'")
         if derived_key_id is not None and root_key_context is None:
             raise ValueError(
                 "Cannot specify 'derived_key_id' without 'root_key_context'"
             )
+        if root_key_context is not None and password is not None:
+            raise ValueError("Cannot specify both 'root_key_context' and 'password'")
 
         if name is None and fileobj is None:
             raise ValueError("Either filename or fileobj must be provided")
