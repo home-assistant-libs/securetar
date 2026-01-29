@@ -542,7 +542,9 @@ class _SecretStreamDecryptReader(DecryptReader):
             if self._ciphertext_size is not None:
                 remaining = self._ciphertext_size - self._pos
                 if remaining <= 0:
-                    raise SecureTarReadError("Missing final tag in secretstream decryption")
+                    raise SecureTarReadError(
+                        "Missing final tag in secretstream decryption"
+                    )
                 chunk_size = min(chunk_size, remaining)
 
             encrypted = self._source.read(chunk_size)
