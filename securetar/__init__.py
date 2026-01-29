@@ -542,14 +542,13 @@ class _SecretStreamDecryptReader(DecryptReader):
             if self._ciphertext_size is not None:
                 remaining = self._ciphertext_size - self._pos
                 if remaining <= 0:
-                    self._done = True
-                    break
+                    raise SecureTarReadError("Missing final tag in secretstream decryption")
                 chunk_size = min(chunk_size, remaining)
 
             encrypted = self._source.read(chunk_size)
             if not encrypted:
-                self._done = True
-                break
+                # Raise error if we expected more data
+                raise SecureTarReadError("Unexpected end of encrypted data")
 
             self._pos += len(encrypted)
             plaintext, tag = nss.crypto_secretstream_xchacha20poly1305_pull(
@@ -567,8 +566,6 @@ class _SecretStreamDecryptReader(DecryptReader):
                     raise SecureTarReadError(
                         "Missing final tag in secretstream decryption"
                     )
-            if self._done and tag != NSS_TAG_FINAL:
-                raise SecureTarReadError("Missing final tag in secretstream decryption")
             if tag == NSS_TAG_FINAL:
                 self._done = True
 
