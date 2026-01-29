@@ -290,7 +290,7 @@ def test_create_encrypted_tar(
 @pytest.mark.parametrize("bufsize", [333, 10240, 4 * 2**20])
 @pytest.mark.parametrize("enable_gzip", [True, False])
 @pytest.mark.parametrize("version", [2, 3])
-def test_create_encrypted_tar_validate_password(
+def test_create_encrypted_tar_validate(
     tmp_path: Path, bufsize: int, enable_gzip: bool, version: int
 ) -> None:
     """Test to create a tar file with encryption."""
@@ -324,17 +324,29 @@ def test_create_encrypted_tar_validate_password(
 
     assert temp_tar.exists()
 
-    # Attempt to validate with wrong password
+    # Attempt to validate password with wrong password
     secure_tar_file = SecureTarFile(
         temp_tar, "r", bufsize=bufsize, password="wrong_password", gzip=enable_gzip
     )
     assert not secure_tar_file.validate_password()
 
-    # Attempt to validate with correct password
+    # Attempt to validate password with correct password
     secure_tar_file = SecureTarFile(
         temp_tar, "r", bufsize=bufsize, password=password, gzip=enable_gzip
     )
     assert secure_tar_file.validate_password()
+
+    # Attempt to validate with wrong password
+    secure_tar_file = SecureTarFile(
+        temp_tar, "r", bufsize=bufsize, password="wrong_password", gzip=enable_gzip
+    )
+    assert not secure_tar_file.validate()
+
+    # Attempt to validate with correct password
+    secure_tar_file = SecureTarFile(
+        temp_tar, "r", bufsize=bufsize, password=password, gzip=enable_gzip
+    )
+    assert secure_tar_file.validate()
 
 
 @patch("securetar.time.time", new=Mock(return_value=1765362043.0))
@@ -1002,7 +1014,7 @@ def test_encrypted_tar_inside_tar(
     ],
 )
 @pytest.mark.parametrize("version", [2, 3])
-def test_encrypted_tar_inside_tar_validate_password(
+def test_encrypted_tar_inside_tar_validate(
     tmp_path: Path,
     bufsize: int,
     enable_gzip: bool,
@@ -1049,6 +1061,20 @@ def test_encrypted_tar_inside_tar_validate_password(
     ) as outer_secure_tar_archive:
         for tar_info in outer_secure_tar_archive.tar:
             assert outer_secure_tar_archive.validate_password(tar_info)
+
+    # Attempt to validate the inner tars with wrong password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate(tar_info)
+
+    # Attempt to validate the inner tars with correct password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert outer_secure_tar_archive.validate(tar_info)
 
 
 @pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
@@ -1386,6 +1412,39 @@ def test_securetararchive_validate_password_unencrypted(tmp_path: Path) -> None:
             secure_tar_archive.validate_password(tarinfo)
 
 
+def test_securetararchive_validate_before_open() -> None:
+    """Test SecureTarArchive.validate call before open."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.validate(tarinfo)
+
+
+def test_securetararchive_validate_write_mode() -> None:
+    """Test SecureTarArchive.validate in write mode."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="Archive not open for reading"):
+            secure_tar_archive.validate(tarinfo)
+
+
+def test_securetararchive_validate_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarArchive.validate specify derived key without encryption."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w")
+    with secure_tar_archive:
+        pass
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="r")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="No password provided"):
+            secure_tar_archive.validate(tarinfo)
+
+
 @pytest.mark.parametrize(
     ("params", "expected_exception", "expected_message"),
     [
@@ -1468,6 +1527,40 @@ def test_securetarfile_validate_password_after_open(tmp_path: Path) -> None:
     with secure_tar_file:
         with pytest.raises(SecureTarError, match="File is already open"):
             secure_tar_file.validate_password()
+
+
+def test_securetarfile_validate_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarFile.validate specify derived key without encryption."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_file = SecureTarFile(name=main_tar, mode="w")
+    with secure_tar_file:
+        pass
+    secure_tar_file = SecureTarFile(name=main_tar, mode="r")
+    with secure_tar_file:
+        with pytest.raises(SecureTarError, match="File is not encrypted"):
+            secure_tar_file.validate()
+
+
+def test_securetarfile_validate_write_mode() -> None:
+    """Test SecureTarFile.validate in write mode."""
+    secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="w", password="hunter2")
+    with secure_tar_file:
+        with pytest.raises(
+            SecureTarError, match="Can only validate password in read mode"
+        ):
+            secure_tar_file.validate()
+
+
+def test_securetarfile_validate_after_open(tmp_path: Path) -> None:
+    """Test SecureTarFile.validate call after open."""
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_file = SecureTarFile(name=main_tar, mode="w", password="hunter2")
+    with secure_tar_file:
+        pass
+    secure_tar_file = SecureTarFile(name=main_tar, mode="r", password="hunter2")
+    with secure_tar_file:
+        with pytest.raises(SecureTarError, match="File is already open"):
+            secure_tar_file.validate()
 
 
 def test_securetarfile_path_fileobj() -> None:

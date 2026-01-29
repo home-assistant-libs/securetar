@@ -718,20 +718,31 @@ class SecureTarDecryptStream:
             self._stream.close()
             self._stream = None
 
-    def validate(self) -> bool:
-        """Validate the password by checking if decrypted data looks like a tar.
+    def validate(self, *, basic_validation: bool) -> bool:
+        """Validate the stream.
+
+        This will fail if the password is invalid or data is corrupted.
+        If the securetar version is 3, it will also validate that the stream
+        is not truncated.
+
+        If basic_validation is True, only the beginning of the stream is validated
+        to check if it looks like a tar/gzip.
 
         Note: This consumes the stream. Create a new instance to read data.
 
         Returns:
             True if password is valid, False otherwise.
         """
+        chunk_size = 1 if basic_validation else 1024 * 1024
         try:
             with self as stream:
-                stream.read(1)
-                return True
+                while stream.read(chunk_size):
+                    if basic_validation:
+                        return True
+                    pass
         except (InvalidPasswordError, SecureTarReadError):
             return False
+        return True
 
 
 class _FramedEncryptReader:
@@ -1005,17 +1016,11 @@ class SecureTarFile:
                 self._file.close()
             self._file = None
 
-    def validate_password(self) -> bool:
-        """Validate the password by checking if decrypted data looks like a tar.
+    def _validate(self, *, basic_validation: bool) -> bool:
+        """Validate the data.
 
-        Note: If using fileobj instead of a file path, this consumes the stream
-        and a new SecureTarFile instance must be created to read data.
-
-        Returns:
-            True if password is valid, False otherwise.
-
-        Raises:
-            SecureTarError: If file is not encrypted, not in read mode, or already open.
+        If basic_validation is True, only the beginning of the stream is validated
+        to check if it looks like a tar/gzip.
         """
         if not self._encrypted:
             raise SecureTarError("File is not encrypted")
@@ -1034,10 +1039,38 @@ class SecureTarFile:
             return SecureTarDecryptStream(
                 file,
                 root_key_context=self._root_key_context,
-            ).validate()
+            ).validate(basic_validation=basic_validation)
         finally:
             if not self._fileobj:
                 file.close()
+
+    def validate_password(self) -> bool:
+        """Validate the password by checking if decrypted data looks like a tar.
+
+        Note: If using fileobj instead of a file path, this consumes the stream
+        and a new SecureTarFile instance must be created to read data.
+
+        Returns:
+            True if password is valid, False otherwise.
+
+        Raises:
+            SecureTarError: If file is not encrypted, not in read mode, or already open.
+        """
+        return self._validate(basic_validation=True)
+
+    def validate(self) -> bool:
+        """Validate the data.
+
+        Note: If using fileobj instead of a file path, this consumes the stream
+        and a new SecureTarFile instance must be created to read data.
+
+        Returns:
+            True if password is valid, False otherwise.
+
+        Raises:
+            SecureTarError: If file is not encrypted, not in read mode, or already open.
+        """
+        return self._validate(basic_validation=False)
 
     @property
     def path(self) -> Path:
@@ -1364,14 +1397,8 @@ class SecureTarArchive:
             encrypted_tar_info.size = encrypted.ciphertext_size
             self._tar.addfile(encrypted_tar_info, encrypted)
 
-    def validate_password(self, member: tarfile.TarInfo) -> bool:
-        """Validate the password against an encrypted inner tar.
-
-        Note: This consumes the stream. Create a new instance to read data.
-
-        Args:
-            member: TarInfo of an encrypted tar file to validate against
-        """
+    def _validate(self, member: tarfile.TarInfo, *, basic_validation: bool) -> bool:
+        """Validate an encrypted inner tar."""
         if not self._tar:
             raise SecureTarError("Archive not open")
 
@@ -1381,7 +1408,27 @@ class SecureTarArchive:
         if not self._root_key_context:
             raise SecureTarError("No password provided")
 
-        return self.extract_tar(member).validate()
+        return self.extract_tar(member).validate(basic_validation=basic_validation)
+
+    def validate_password(self, member: tarfile.TarInfo) -> bool:
+        """Validate the password against an encrypted inner tar.
+
+        Note: This consumes the stream. Create a new instance to read data.
+
+        Args:
+            member: TarInfo of an encrypted tar file to validate against
+        """
+        return self._validate(member, basic_validation=True)
+
+    def validate(self, member: tarfile.TarInfo) -> bool:
+        """Validate an encrypted inner tar.
+
+        Note: This consumes the stream. Create a new instance to read data.
+
+        Args:
+            member: TarInfo of an encrypted tar file to validate against
+        """
+        return self._validate(member, basic_validation=False)
 
 
 class KeyDerivationStrategy(ABC):
