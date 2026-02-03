@@ -269,9 +269,16 @@ class DecryptReader(CipherReader):
         source: IO[bytes],
         key_material: SecureTarDerivedKeyMaterial,
         ciphertext_size: int | None = None,
+        plaintext_size: int | None = None,
     ) -> None:
         """Initialize decryption reader."""
         super().__init__(source, ciphertext_size)
+        self._plaintext_size = plaintext_size
+
+    @property
+    def plaintext_size(self) -> int | None:
+        """Return the total plaintext bytes written."""
+        return self._plaintext_size
 
 
 class EncryptWriter(CipherStream):
@@ -346,9 +353,10 @@ class _AesCbcDecryptReader(DecryptReader):
         source: IO[bytes],
         key_material: SecureTarDerivedKeyMaterial,
         ciphertext_size: int | None = None,
+        plaintext_size: int | None = None,
     ) -> None:
         """Initialize."""
-        super().__init__(source, key_material, ciphertext_size)
+        super().__init__(source, key_material, ciphertext_size, plaintext_size)
         self._pos = 0
         self._validated = False
 
@@ -521,9 +529,10 @@ class _SecretStreamDecryptReader(DecryptReader):
         source: IO[bytes],
         key_material: SecureTarDerivedKeyMaterial,
         ciphertext_size: int | None = None,
+        plaintext_size: int | None = None,
     ) -> None:
         """Initialize."""
-        super().__init__(source, key_material, ciphertext_size)
+        super().__init__(source, key_material, ciphertext_size, plaintext_size)
         self._pos = 0
 
         # Initialize from header stored in cipher_initialization
@@ -712,6 +721,7 @@ class SecureTarDecryptStream:
             self._source,
             key_material,
             ciphertext_size,
+            self._header.plaintext_size,
         )
         return self._stream
 
@@ -956,7 +966,7 @@ class SecureTarFile:
             key_material = self._root_key_context.restore_key_material(self._header)
             factory = self._root_key_context.stream_factory
             self._cipher_stream = factory.create_decrypt_reader(
-                self._file, key_material
+                self._file, key_material, plaintext_size=self._header.plaintext_size
             )
         else:
             # _create_version set in constructor if encrypted
