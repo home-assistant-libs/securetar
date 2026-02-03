@@ -836,10 +836,12 @@ class SecureTarEncryptStream:
 class SecureTarFile:
     """Handle tar files, optionally wrapped in an encryption layer."""
 
+    supported_modes = (MOD_READ,)
+
     def __init__(
         self,
         name: Path | None = None,
-        mode: Literal["r", "w", "x"] = "r",
+        mode: Literal["r"] = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
         create_version: int | None = None,
@@ -883,10 +885,8 @@ class SecureTarFile:
         if name is None and fileobj is None:
             raise ValueError("Either filename or fileobj must be provided")
 
-        if mode not in (MOD_EXCLUSIVE, MOD_READ, MOD_WRITE):
-            raise ValueError(
-                f"Mode must be '{MOD_EXCLUSIVE}', '{MOD_READ}', or '{MOD_WRITE}'"
-            )
+        if mode not in self.supported_modes:
+            raise ValueError(f"Mode must be '{', '.join(self.supported_modes)}'")
 
         self._file: IO[bytes] | None = None
         self._mode: str = mode
@@ -1092,13 +1092,14 @@ class InnerSecureTarFile(SecureTarFile):
 
     _header_length: int
     _header_position: int
+    supported_modes = (MOD_WRITE,)
     _tar_info: tarfile.TarInfo
 
     def __init__(
         self,
         outer_tar: tarfile.TarFile,
         name: Path,
-        mode: Literal["r", "w", "x"],
+        mode: Literal["w"],
         *,
         bufsize: int,
         derived_key_id: Hashable | None,
