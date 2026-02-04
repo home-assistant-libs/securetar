@@ -561,9 +561,7 @@ class _SecretStreamDecryptReader(DecryptReader):
 
             # Check bounds
             remaining = self._ciphertext_size - self._pos
-            if remaining <= 0:
-                raise SecureTarReadError("Missing final tag in secretstream decryption")
-            chunk_size = min(chunk_size, remaining)
+            chunk_size = min(chunk_size, max(remaining, 0))
 
             encrypted = self._source.read(chunk_size)
 
