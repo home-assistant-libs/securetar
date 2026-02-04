@@ -29,6 +29,7 @@ from nacl.bindings.crypto_secretstream import (
     crypto_secretstream_xchacha20poly1305_TAG_MESSAGE as NSS_TAG_MESSAGE,
 )
 import nacl.encoding
+from nacl.exceptions import CryptoError
 from nacl.hash import blake2b
 from nacl.pwhash.argon2id import kdf, SALTBYTES as ARGON2_SALT_SIZE
 from nacl.utils import random as nacl_random
@@ -754,7 +755,7 @@ class SecureTarDecryptStream:
                     if basic_validation:
                         return True
                     pass
-        except (InvalidPasswordError, SecureTarReadError):
+        except (InvalidPasswordError, SecureTarReadError, CryptoError):
             return False
         return True
 

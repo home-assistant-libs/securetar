@@ -1,6 +1,6 @@
 """Test Tarfile functions."""
 
-from collections.abc import Callable, Generator, Hashable
+from collections.abc import Callable, Hashable
 import gzip
 import io
 import os
@@ -12,10 +12,15 @@ from pathlib import Path, PurePath
 from typing import Any
 from unittest.mock import Mock, patch
 
+import nacl
 import pytest
 
 from securetar import (
     SECURETAR_MAGIC,
+    SECURETAR_V2_HEADER_SIZE,
+    SECURETAR_V3_HEADER_SIZE,
+    V3_SECRETSTREAM_ABYTES,
+    V3_SECRETSTREAM_CHUNK_SIZE,
     AddFileError,
     InvalidPasswordError,
     SecureTarArchive,
@@ -28,11 +33,29 @@ from securetar import (
 )
 
 
-@pytest.fixture(autouse=True)
-def decrease_chunk_size() -> Generator[None]:
-    """Speed up tests by reducing Argon2 parameters."""
-    with patch("securetar.V3_SECRETSTREAM_CHUNK_SIZE", new=2048):
-        yield
+def get_ciphertext_size_v2(plaintext_size: int) -> int:
+    """Get expected ciphertext size for v2."""
+    # Padding to next 16 byte block
+    padding = 16 - (plaintext_size % 16)
+    return plaintext_size + padding + SECURETAR_V2_HEADER_SIZE
+
+
+def get_ciphertext_size_v3(plaintext_size: int) -> int:
+    """Get expected ciphertext size for v3."""
+    num_chunks = (
+        plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
+    ) // V3_SECRETSTREAM_CHUNK_SIZE
+    if num_chunks == 0:
+        num_chunks = 1
+    return (
+        plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES + SECURETAR_V3_HEADER_SIZE
+    )
+
+
+get_ciphertext_size: dict[int, Callable[[int], int]] = {
+    2: get_ciphertext_size_v2,
+    3: get_ciphertext_size_v3,
+}
 
 
 @dataclass
@@ -68,8 +91,22 @@ def test_not_secure_path() -> None:
     [
         (
             Mock(return_value=False),
-            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
-            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
+            {
+                ".",
+                "README.md",
+                "large_file",
+                "test_symlink",
+                "test1",
+                "test1/script.sh",
+            },
+            {
+                ".",
+                "README.md",
+                "large_file",
+                "test_symlink",
+                "test1",
+                "test1/script.sh",
+            },
         ),
         (
             Mock(return_value=True),
@@ -78,8 +115,15 @@ def test_not_secure_path() -> None:
         ),
         (
             Mock(wraps=lambda path: path.name == "README.md"),
-            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
-            {".", "test_symlink", "test1", "test1/script.sh"},
+            {
+                ".",
+                "README.md",
+                "large_file",
+                "test_symlink",
+                "test1",
+                "test1/script.sh",
+            },
+            {".", "large_file", "test_symlink", "test1", "test1/script.sh"},
         ),
     ],
 )
@@ -610,20 +654,26 @@ def test_tar_inside_tar_encrypt(
     ):
         for inner_tar_file in inner_tar_files:
             encrypted_tar_info = encrypted_archive.tar.getmember(inner_tar_file)
-            # TODO: fix size check for v3
-            # plain_tar_info = plain_archive.tar.getmember(inner_tar_file)
-            # assert (
-            #    encrypted_tar_info.size
-            #    == plain_tar_info.size + 16 - plain_tar_info.size % 16 + 16 + 32
-            # )
+            plain_tar_info = plain_archive.tar.getmember(inner_tar_file)
+            assert encrypted_tar_info.size == get_ciphertext_size[version](
+                plain_tar_info.size
+            )
 
     # Check the encrypted inner tars can be opened
     temp_decrypted = tmp_path.joinpath("decrypted")
     os.makedirs(temp_decrypted, exist_ok=True)
-    with SecureTarArchive(main_tar_encrypted, password=password) as encrypted_archive:
+    with (
+        SecureTarArchive(main_tar_encrypted, password=password) as encrypted_archive,
+        SecureTarArchive(main_tar, "r", bufsize=bufsize) as plain_archive,
+    ):
         for inner_tar_file in inner_tar_files:
             encrypted_tar_info = encrypted_archive.tar.getmember(inner_tar_file)
             with encrypted_archive.extract_tar(encrypted_tar_info) as decrypted:
+                # Check DecryptReader.plaintext_size is correct
+                assert (
+                    decrypted.plaintext_size
+                    == plain_archive.tar.getmember(inner_tar_file).size
+                )
                 decrypted_inner_tar_path = temp_decrypted.joinpath(inner_tar_file)
                 with open(decrypted_inner_tar_path, "wb") as file:
                     while data := decrypted.read(bufsize):
@@ -643,6 +693,7 @@ def test_tar_inside_tar_encrypt(
             assert files == {
                 ".",
                 "README.md",
+                "large_file",
                 "test1",
                 "test1/script.sh",
                 "test_symlink",
@@ -796,12 +847,13 @@ def test_encrypted_tar_inside_tar(
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
                 with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
+                    # Check DecryptReader.plaintext_size is correct
+                    assert decrypted.plaintext_size == file_sizes[tar_info.name]
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
             # Check the indicated size is correct
-            # TODO: Fix size check for v3
-            # assert inner_tar_path.stat().st_size == file_sizes[tar_info.name]
+            assert inner_tar_path.stat().st_size == file_sizes[tar_info.name]
 
             # Check decrypted file is valid gzip, this fails if the padding is not
             # discarded correctly
@@ -817,6 +869,7 @@ def test_encrypted_tar_inside_tar(
             assert files == {
                 ".",
                 "README.md",
+                "large_file",
                 "test1",
                 "test1/script.sh",
                 "test_symlink",
@@ -930,6 +983,58 @@ def test_encrypted_tar_inside_tar_validate(
 
 
 @pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("main_tar_file", "password_validation_result"),
+    [
+        ("backup_no_final_tag.tar", True),
+        ("backup_early_final_tag.tar", False),
+        ("backup_empty.tar", False),
+        ("backup_truncated.tar", True),
+    ],
+)
+def test_encrypted_tar_inside_tar_validate_secretstream_errors(
+    bufsize: int,
+    main_tar_file: str,
+    password_validation_result: bool,
+) -> None:
+    password = "hunter2"
+
+    fixture_path = Path(__file__).parent.joinpath("fixtures")
+    main_tar = fixture_path.joinpath(f"./{main_tar_file}")
+
+    # Attempt to validate the inner tars with wrong password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate_password(tar_info)
+
+    # Attempt to validate the inner tars with correct password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert (
+                outer_secure_tar_archive.validate_password(tar_info)
+                == password_validation_result
+            )
+
+    # Attempt to validate the inner tars with wrong password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate(tar_info)
+
+    # Attempt to validate the inner tars with correct password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate(tar_info)
+
+
+@pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
 def test_encrypted_gzipped_tar_inside_tar_legacy_format(
     tmp_path: Path, bufsize: int
 ) -> None:
@@ -1013,6 +1118,113 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
                 "test1/script.sh",
                 "test_symlink",
             }
+
+
+@pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("archive", "inner_tar", "expected_exception", "expected_message"),
+    [
+        (
+            "backup_early_final_tag.tar",
+            "core_early_final_tag.tar.gz",
+            SecureTarError,
+            "Unexpected final tag in secretstream decryption",
+        ),
+        (
+            "backup_no_final_tag.tar",
+            "core_no_final_tag.tar.gz",
+            SecureTarError,
+            "Missing final tag in secretstream decryption",
+        ),
+        (
+            "backup_empty.tar",
+            "core_empty.tar.gz",
+            nacl.exceptions.ValueError,
+            "Ciphertext is too short",
+        ),
+        (
+            "backup_truncated.tar",
+            "core_truncated.tar.gz",
+            nacl.exceptions.RuntimeError,
+            "Unexpected failure",
+        ),
+    ],
+)
+def test_archive_secretstream_errors(
+    tmp_path: Path,
+    bufsize: int,
+    archive: str,
+    inner_tar: str,
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    password = "hunter2"
+
+    fixture_path = Path(__file__).parent.joinpath("fixtures")
+    main_tar = fixture_path.joinpath(archive)
+
+    # Attempt decrypting the inner tar
+    with (
+        SecureTarArchive(
+            main_tar, "r", bufsize=bufsize, password=password
+        ) as outer_secure_tar_archive,
+    ):
+        tar_info = outer_secure_tar_archive.tar.getmember(inner_tar)
+        with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
+            with pytest.raises(expected_exception, match=expected_message):
+                while decrypted.read(bufsize):
+                    pass
+
+
+@pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("tar_name", "expected_exception", "expected_message"),
+    [
+        (
+            "core_early_final_tag.tar.gz",
+            SecureTarError,
+            "Unexpected final tag in secretstream decryption",
+        ),
+        (
+            "core_no_final_tag.tar.gz",
+            SecureTarError,
+            "Missing final tag in secretstream decryption",
+        ),
+        (
+            "core_empty.tar.gz",
+            nacl.exceptions.ValueError,
+            "Ciphertext is too short",
+        ),
+        (
+            "core_truncated.tar.gz",
+            nacl.exceptions.RuntimeError,
+            "Unexpected failure",
+        ),
+    ],
+)
+def test_secretstream_errors(
+    tmp_path: Path,
+    bufsize: int,
+    tar_name: str,
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    password = "hunter2"
+
+    fixture_path = Path(__file__).parent.joinpath("fixtures")
+    tar_path = fixture_path.joinpath(tar_name)
+
+    # Attempt decrypting the inner tar
+    temp_decrypted = tmp_path.joinpath("decrypted")
+    os.makedirs(temp_decrypted, exist_ok=True)
+    with pytest.raises(expected_exception, match=expected_message):
+        with SecureTarFile(tar_path, "r", bufsize=bufsize, password=password) as tar:
+            for tar_info in tar:
+                if not tar_info.size:
+                    continue
+                with tar.extractfile(tar_info) as file:
+                    while file.read(bufsize):
+                        pass
 
 
 def test_outer_tar_open_close(tmp_path: Path) -> None:
