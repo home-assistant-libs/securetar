@@ -532,6 +532,18 @@ class _SecretStreamDecryptReader(DecryptReader):
         plaintext_size: int | None = None,
     ) -> None:
         """Initialize."""
+        if plaintext_size is None:
+            raise ValueError("Plaintext size is required")
+
+        # Calculate ciphertext size based on plaintext size which is always
+        # known for v3
+        num_chunks = (
+            plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
+        ) // V3_SECRETSTREAM_CHUNK_SIZE
+        if num_chunks == 0:
+            num_chunks = 1
+        ciphertext_size = plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES
+
         super().__init__(source, key_material, ciphertext_size, plaintext_size)
         self._pos = 0
 
@@ -547,19 +559,13 @@ class _SecretStreamDecryptReader(DecryptReader):
         while len(self._buffer) < size and not self._done:
             chunk_size = V3_SECRETSTREAM_CHUNK_SIZE + V3_SECRETSTREAM_ABYTES
 
-            # Check bounds if we have a known size
-            if self._ciphertext_size is not None:
-                remaining = self._ciphertext_size - self._pos
-                if remaining <= 0:
-                    raise SecureTarReadError(
-                        "Missing final tag in secretstream decryption"
-                    )
-                chunk_size = min(chunk_size, remaining)
+            # Check bounds
+            remaining = self._ciphertext_size - self._pos
+            if remaining <= 0:
+                raise SecureTarReadError("Missing final tag in secretstream decryption")
+            chunk_size = min(chunk_size, remaining)
 
             encrypted = self._source.read(chunk_size)
-            if not encrypted:
-                # Raise error if we expected more data
-                raise SecureTarReadError("Unexpected end of encrypted data")
 
             self._pos += len(encrypted)
             plaintext, tag = nss.crypto_secretstream_xchacha20poly1305_pull(
@@ -567,16 +573,14 @@ class _SecretStreamDecryptReader(DecryptReader):
             )
             self._buffer += plaintext
 
-            if self._ciphertext_size is not None:
-                remaining = self._ciphertext_size - self._pos
-                if tag == NSS_TAG_FINAL and remaining != 0:
-                    raise SecureTarReadError(
-                        "Unexpected final tag in secretstream decryption"
-                    )
-                if remaining == 0 and tag != NSS_TAG_FINAL:
-                    raise SecureTarReadError(
-                        "Missing final tag in secretstream decryption"
-                    )
+            remaining = self._ciphertext_size - self._pos
+            if tag == NSS_TAG_FINAL and remaining != 0:
+                raise SecureTarReadError(
+                    "Unexpected final tag in secretstream decryption"
+                )
+            if remaining == 0 and tag != NSS_TAG_FINAL:
+                raise SecureTarReadError("Missing final tag in secretstream decryption")
+
             if tag == NSS_TAG_FINAL:
                 self._done = True
 
