@@ -614,7 +614,7 @@ class _SecretStreamEncryptWriter(EncryptWriter):
         """Write plaintext data to be encrypted."""
         self._buffer += data
 
-        while len(self._buffer) >= V3_SECRETSTREAM_CHUNK_SIZE:
+        while len(self._buffer) > V3_SECRETSTREAM_CHUNK_SIZE:
             chunk = self._buffer[:V3_SECRETSTREAM_CHUNK_SIZE]
             self._buffer = self._buffer[V3_SECRETSTREAM_CHUNK_SIZE:]
             encrypted = nss.crypto_secretstream_xchacha20poly1305_push(
