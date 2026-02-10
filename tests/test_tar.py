@@ -986,10 +986,15 @@ def test_encrypted_tar_inside_tar_validate(
 @pytest.mark.parametrize(
     ("main_tar_file", "password_validation_result"),
     [
+        # Files where the beginning of the file is correct, but there's a
+        # secretstream error later in the file. We expect password validation
+        # to succeed.
         ("backup_no_final_tag.tar", True),
+        ("backup_truncated.tar", True),
+        # Files where there's a secretstream error already in the first block,
+        # we expect password validation to fail.
         ("backup_early_final_tag.tar", False),
         ("backup_empty.tar", False),
-        ("backup_truncated.tar", True),
     ],
 )
 def test_encrypted_tar_inside_tar_validate_secretstream_errors(
@@ -1002,7 +1007,8 @@ def test_encrypted_tar_inside_tar_validate_secretstream_errors(
     fixture_path = Path(__file__).parent.joinpath("fixtures")
     main_tar = fixture_path.joinpath(f"./{main_tar_file}")
 
-    # Attempt to validate the inner tars with wrong password
+    # Attempt to validate the inner tars with wrong password, we always expect
+    # this to fail
     with SecureTarArchive(
         main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
     ) as outer_secure_tar_archive:
@@ -1019,14 +1025,17 @@ def test_encrypted_tar_inside_tar_validate_secretstream_errors(
                 == password_validation_result
             )
 
-    # Attempt to validate the inner tars with wrong password
+    # Attempt to validate the inner tars with wrong password, we always expect
+    # this to fail
     with SecureTarArchive(
         main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
     ) as outer_secure_tar_archive:
         for tar_info in outer_secure_tar_archive.tar:
             assert not outer_secure_tar_archive.validate(tar_info)
 
-    # Attempt to validate the inner tars with correct password
+    # Attempt to validate the inner tars with correct password. All the fixtures
+    # have some kind of secretstream error, so we expect validation to fail for
+    # all of them.
     with SecureTarArchive(
         main_tar, "r", bufsize=bufsize, password=password, streaming=True
     ) as outer_secure_tar_archive:
