@@ -536,13 +536,15 @@ class _SecretStreamDecryptReader(DecryptReader):
         if plaintext_size is None:
             raise ValueError("Plaintext size is required")
 
-        # Calculate ciphertext size based on plaintext size which is always
-        # known for v3
+        # Calculate number of chunks using integer ceiling division to avoid
+        # rounding issues, and ensure at least 1 chunk for empty plaintext
         num_chunks = (
             plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
         ) // V3_SECRETSTREAM_CHUNK_SIZE
         if num_chunks == 0:
             num_chunks = 1
+        # Calculate ciphertext size based on plaintext size which is always
+        # known for v3
         ciphertext_size = plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES
 
         super().__init__(source, key_material, ciphertext_size, plaintext_size)
@@ -646,13 +648,15 @@ class _SecretStreamEncryptReader(EncryptReader):
         plaintext_size: int,
     ) -> None:
         """Initialize."""
-        # Calculate ciphertext size
         super().__init__(source, key_material, plaintext_size)
+        # Calculate number of chunks using integer ceiling division to avoid
+        # rounding issues, and ensure at least 1 chunk for empty plaintext
         num_chunks = (
             plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
         ) // V3_SECRETSTREAM_CHUNK_SIZE
         if num_chunks == 0:
             num_chunks = 1
+        # Calculate ciphertext size
         self._ciphertext_size = plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES
 
         self._pos = 0
