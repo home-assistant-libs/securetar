@@ -582,10 +582,12 @@ def test_tar_inside_tar(
         ),
     ],
 )
+@pytest.mark.parametrize("version", [2, 3])
 def test_inner_tar_header_format(
     tmp_path: Path,
     outer_tar_header_format: str,
     expected_result: AbstractContextManager[None],
+    version: int,
 ) -> None:
     """Test inner tar with different outer tar header formats."""
     # Create Tarfile
@@ -602,10 +604,12 @@ def test_inner_tar_header_format(
                 name=Path("inner.tar"),
                 derived_key_id=None,
                 root_key_context=None,
+                create_version=version,
             )
 
 
-def test_inner_tar_force_pax_header(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [2, 3])
+def test_inner_tar_force_pax_header(tmp_path: Path, version: int) -> None:
     """Test inner tar forces PAX header format."""
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
@@ -618,6 +622,7 @@ def test_inner_tar_force_pax_header(tmp_path: Path) -> None:
             name=Path("inner.tar"),
             derived_key_id=None,
             root_key_context=None,
+            create_version=version,
         )
         with inner_tar as inner_tar_file:
             assert inner_tar_file.format == tarfile.PAX_FORMAT
