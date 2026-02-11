@@ -7,7 +7,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, v3_feature]
+    branches: [main]
 
 jobs:
   test:
