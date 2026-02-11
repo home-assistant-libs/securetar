@@ -7,6 +7,7 @@ from collections.abc import Callable, Generator, Hashable
 import copy
 import enum
 import hashlib
+import hmac
 import logging
 import os
 import struct
@@ -1532,7 +1533,10 @@ class KeyDerivationV3(KeyDerivationStrategy):
             password, root_salt, validation_salt
         )
 
-        if validation_key != stored_validation_key:
+        # Use hmac.compare_digest to prevent timing attacks. Note that the
+        # validation key is stored in plaintext in the header, so this is
+        # primarily to avoid false positives from code analysis tools.
+        if not hmac.compare_digest(validation_key, stored_validation_key):
             raise InvalidPasswordError("Invalid password")
 
         return cls(root_key, root_salt, validation_salt, validation_key)
