@@ -115,7 +115,7 @@ MOD_EXCLUSIVE = "x"
 MOD_READ = "r"
 MOD_WRITE = "w"
 
-DEFAULT_CIPHER_VERSION = 2
+DEFAULT_CIPHER_VERSION = 3
 
 
 class CipherMode(enum.Enum):
@@ -874,7 +874,7 @@ class SecureTarFile:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
             bufsize: Buffer size for I/O operations
-            create_version: SecureTar version to create (2 or 3). If None, defaults to 2
+            create_version: SecureTar version to create (2 or 3). If None, defaults to 3
             derived_key_id: Optional derived key ID for deriving key material. Mutually
             exclusive with password.
             fileobj: File object to use instead of opening a file
@@ -1242,7 +1242,7 @@ class SecureTarArchive:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
             bufsize: Buffer size for I/O operations
-            create_version: SecureTar version to create (2 or 3). If None, defaults to 2
+            create_version: SecureTar version to create (2 or 3). If None, defaults to 3
             fileobj: File object to use instead of opening a file
             password: Password for encryption/decryption of inner tar files. Mutually
             exclusive with root_key_context.
