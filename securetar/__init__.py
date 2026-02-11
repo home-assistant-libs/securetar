@@ -14,7 +14,7 @@ import struct
 import tarfile
 import time
 from pathlib import Path, PurePath
-from types import NoneType
+from types import NoneType, TracebackType
 from typing import TYPE_CHECKING, Any, IO, BinaryIO, Literal
 
 from cryptography.hazmat.backends import default_backend
@@ -528,6 +528,8 @@ class _SecretStreamDecryptReader(DecryptReader):
     XChaCha20-Poly1305 is used in SecureTar v3.
     """
 
+    _ciphertext_size: int
+
     def __init__(
         self,
         source: IO[bytes],
@@ -735,7 +737,12 @@ class SecureTarDecryptStream:
         )
         return self._stream
 
-    def __exit__(self, exc_type, exc_value, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         if self._stream:
             self._stream.close()
             self._stream = None
@@ -847,7 +854,12 @@ class SecureTarEncryptStream:
         self._stream = _FramedEncryptReader(inner_stream, header)
         return self._stream
 
-    def __exit__(self, exc_type, exc_value, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         if self._stream:
             self._stream.close()
             self._stream = None
@@ -953,7 +965,8 @@ class SecureTarFile:
         """
         if not self._encrypted:
             # Plain tar, no encryption
-            self._tar = tarfile.open(
+            # Ignore mypy because of typing issues with the mode and extra args
+            self._tar = tarfile.open(  # type: ignore[call-overload]
                 name=str(self._name),
                 mode=self._tar_mode,
                 dereference=False,
@@ -997,7 +1010,8 @@ class SecureTarFile:
             )
 
         # Open tar with cipher as fileobj
-        self._tar = tarfile.open(
+        # Ignore mypy because of typing issues with the mode and fileobj
+        self._tar = tarfile.open(  # type: ignore[call-overload]
             fileobj=self._cipher_stream,
             mode=self._tar_mode,
             dereference=False,
@@ -1022,7 +1036,12 @@ class SecureTarFile:
             fd = os.open(self._name, file_mode, 0o666)
             return os.fdopen(fd, "rb" if read_mode else "wb")
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         self.close()
 
     def close(self) -> None:
@@ -1095,7 +1114,7 @@ class SecureTarFile:
         return self._validate(basic_validation=False)
 
     @property
-    def path(self) -> Path:
+    def path(self) -> Path | None:
         """Return path object of tarfile."""
         return self._name
 
@@ -1134,7 +1153,8 @@ class InnerSecureTarFile(SecureTarFile):
             gzip=gzip,
             bufsize=bufsize,
             derived_key_id=derived_key_id,
-            fileobj=outer_tar.fileobj,
+            # https://github.com/python/typeshed/issues/15365
+            fileobj=outer_tar.fileobj,  # type:ignore[arg-type]
             create_version=create_version,
             root_key_context=root_key_context,
         )
@@ -1156,6 +1176,10 @@ class InnerSecureTarFile(SecureTarFile):
         self._tar_info.mtime = time.time()
 
         fileobj = self.outer_tar.fileobj
+        if TYPE_CHECKING:
+            # tarfile.TarFile.fileobj is incorrectly typed, see
+            # https://github.com/python/typeshed/issues/15365
+            assert fileobj is not None
 
         self._header_position = fileobj.tell()
 
@@ -1170,14 +1194,19 @@ class InnerSecureTarFile(SecureTarFile):
 
         return super().__enter__()
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close file."""
         # This class is only used for writing inner tar files, so we know
         # that if _cipher_stream is set, it is an EncryptWriter.
         if TYPE_CHECKING:
             assert isinstance(self._cipher_stream, (EncryptWriter, NoneType))
         # Capture encrypt_writer before super().__exit__ sets it to None
-        encrypt_writer: EncryptWriter | None = self._cipher_stream  # type: ignore[assignment]
+        encrypt_writer: EncryptWriter | None = self._cipher_stream
         super().__exit__(exc_type, exc_value, traceback)
         self._finalize_tar_entry(encrypt_writer)
 
@@ -1185,6 +1214,10 @@ class InnerSecureTarFile(SecureTarFile):
         """Update tar header and securetar header with final sizes."""
         outer_tar = self.outer_tar
         fileobj = self.outer_tar.fileobj
+        if TYPE_CHECKING:
+            # tarfile.TarFile.fileobj is incorrectly typed, see
+            # https://github.com/python/typeshed/issues/15365
+            assert fileobj is not None
 
         end_position = fileobj.tell()
 
@@ -1217,7 +1250,9 @@ class InnerSecureTarFile(SecureTarFile):
         )
         fileobj.write(buf)
         outer_tar.offset += len(buf)
-        outer_tar.members.append(self._tar_info)
+        # Tarfile.members is not specified in the type stubs and we don't
+        # want to use the getter Tarfile.getmembers().
+        outer_tar.members.append(self._tar_info)  # type: ignore[attr-defined]
 
         # Finally return to the end of the outer tar file
         fileobj.seek(end_position + padding_size)
@@ -1289,7 +1324,8 @@ class SecureTarArchive:
     def open(self) -> SecureTarArchive:
         """Open the archive."""
         mode = f"{self._mode}{'|' if self._streaming else ''}"
-        self._tar = tarfile.open(
+        # Ignore mypy because of typing issues with the mode and fileobj
+        self._tar = tarfile.open(  # type: ignore[call-overload]
             name=str(self._name) if self._name else None,
             mode=mode,
             fileobj=self._fileobj,
@@ -1297,7 +1333,12 @@ class SecureTarArchive:
         )
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         """Close the archive."""
         self.close()
 
@@ -1407,6 +1448,10 @@ class SecureTarArchive:
 
         if not self._root_key_context:
             raise SecureTarError("No password provided")
+
+        if TYPE_CHECKING:
+            # create_version is set in constructor if in write mode
+            assert self._create_version is not None
 
         with SecureTarEncryptStream(
             source,
