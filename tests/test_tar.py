@@ -263,7 +263,6 @@ def test_create_encrypted_tar_validate(
         with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
             secure_tar_file = SecureTarFile(
                 None,
-                "r",
                 bufsize=bufsize,
                 fileobj=inner_tar_file_obj,
                 password="wrong_password",
@@ -276,7 +275,6 @@ def test_create_encrypted_tar_validate(
         with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
             secure_tar_file = SecureTarFile(
                 None,
-                "r",
                 bufsize=bufsize,
                 fileobj=inner_tar_file_obj,
                 password=password,
@@ -289,7 +287,6 @@ def test_create_encrypted_tar_validate(
         with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
             secure_tar_file = SecureTarFile(
                 None,
-                "r",
                 bufsize=bufsize,
                 fileobj=inner_tar_file_obj,
                 password="wrong_password",
@@ -302,7 +299,6 @@ def test_create_encrypted_tar_validate(
         with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
             secure_tar_file = SecureTarFile(
                 None,
-                "r",
                 bufsize=bufsize,
                 fileobj=inner_tar_file_obj,
                 password=password,
@@ -517,7 +513,7 @@ def test_tar_inside_tar(
 
     # Iterate over the tar file, and check there's no securetar header
     files = set()
-    with SecureTarFile(main_tar, "r", gzip=False) as tar_file:
+    with SecureTarFile(main_tar, gzip=False) as tar_file:
         for tar_info in tar_file:
             inner_tar = tar_file.extractfile(tar_info)
             assert inner_tar.read(len(SECURETAR_MAGIC)) != SECURETAR_MAGIC
@@ -526,7 +522,7 @@ def test_tar_inside_tar(
 
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(main_tar, "r", gzip=False) as tar_file:
+    with SecureTarFile(main_tar, gzip=False) as tar_file:
         tar_file.extractall(path=temp_new)
 
     assert temp_new.is_dir()
@@ -548,7 +544,7 @@ def test_tar_inside_tar(
         temp_inner_new = tmp_path.joinpath(f"{inner_tar_file}_inner_new")
 
         with SecureTarFile(
-            temp_new.joinpath(inner_tar_file), "r", gzip=enable_gzip
+            temp_new.joinpath(inner_tar_file), gzip=enable_gzip
         ) as tar_file:
             tar_file.extractall(path=temp_inner_new, members=tar_file)
 
@@ -801,7 +797,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
     assert main_tar.exists()
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(main_tar, "r", gzip=False) as tar_file:
+    with SecureTarFile(main_tar, gzip=False) as tar_file:
         tar_file.extractall(path=temp_new)
 
     assert temp_new.is_dir()
@@ -813,7 +809,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
     # Extract inner tar
     temp_inner_new = tmp_path.joinpath("good.tar.gz_inner_new")
 
-    with SecureTarFile(temp_new.joinpath("good.tar.gz"), "r", gzip=True) as tar_file:
+    with SecureTarFile(temp_new.joinpath("good.tar.gz"), gzip=True) as tar_file:
         tar_file.extractall(path=temp_inner_new, members=tar_file)
 
     assert temp_inner_new.is_dir()
@@ -831,7 +827,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
     # Extract failed inner tar (should not raise but will be empty)
     temp_inner_new = tmp_path.joinpath("failed.tar.gz_inner_new")
 
-    with SecureTarFile(temp_new.joinpath("failed.tar.gz"), "r", gzip=True) as tar_file:
+    with SecureTarFile(temp_new.joinpath("failed.tar.gz"), gzip=True) as tar_file:
         tar_file.extractall(path=temp_inner_new, members=tar_file)
 
 
@@ -944,7 +940,7 @@ def test_encrypted_tar_inside_tar(
 
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(main_tar, "r", gzip=False, bufsize=bufsize) as tar_file:
+    with SecureTarFile(main_tar, gzip=False, bufsize=bufsize) as tar_file:
         tar_file.extractall(path=temp_new)
 
     assert temp_new.is_dir()
@@ -957,7 +953,6 @@ def test_encrypted_tar_inside_tar(
 
         with SecureTarFile(
             temp_new.joinpath(inner_tar_file),
-            "r",
             password=password,
             gzip=enable_gzip,
             bufsize=bufsize,
@@ -1294,7 +1289,7 @@ def test_secretstream_errors(
     temp_decrypted = tmp_path.joinpath("decrypted")
     os.makedirs(temp_decrypted, exist_ok=True)
     with pytest.raises(expected_exception, match=expected_message):
-        with SecureTarFile(tar_path, "r", bufsize=bufsize, password=password) as tar:
+        with SecureTarFile(tar_path, bufsize=bufsize, password=password) as tar:
             for tar_info in tar:
                 if not tar_info.size:
                     continue
@@ -1326,7 +1321,7 @@ def test_outer_tar_open_close(tmp_path: Path) -> None:
 
     # Restore
     temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(main_tar, "r", gzip=False) as tar_file:
+    with SecureTarFile(main_tar, gzip=False) as tar_file:
         tar_file.extractall(path=temp_new, members=tar_file)
 
     assert temp_new.is_dir()
@@ -1594,16 +1589,6 @@ def test_securetararchive_validate_unencrypted(tmp_path: Path) -> None:
             "Version must be None when reading a SecureTar file",
         ),
         (
-            {"create_version": 1, "mode": "w"},
-            ValueError,
-            "Unsupported SecureTar version: 1",
-        ),
-        (
-            {"create_version": 4, "mode": "w"},
-            ValueError,
-            "Unsupported SecureTar version: 4",
-        ),
-        (
             {"derived_key_id": "123"},
             ValueError,
             "Cannot specify 'derived_key_id' without 'root_key_context'",
@@ -1618,11 +1603,6 @@ def test_securetararchive_validate_unencrypted(tmp_path: Path) -> None:
             ValueError,
             "Either filename or fileobj must be provided",
         ),
-        (
-            {"name": "test.tar", "mode": "invalid_mode"},
-            ValueError,
-            "Mode must be 'r'",
-        ),
     ],
 )
 def test_securetarfile_error_handling(
@@ -1635,6 +1615,39 @@ def test_securetarfile_error_handling(
         SecureTarFile(**params)
 
 
+@pytest.mark.parametrize(
+    ("params", "expected_exception", "expected_message"),
+    [
+        (
+            {"create_version": 1},
+            ValueError,
+            "Unsupported SecureTar version: 1",
+        ),
+        (
+            {"create_version": 4},
+            ValueError,
+            "Unsupported SecureTar version: 4",
+        ),
+    ],
+)
+def test_innersecuretarfile_error_handling(
+    params: dict[str, Any],
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    """Test SecureTarFile constructor error handling."""
+    with pytest.raises(expected_exception, match=expected_message):
+        InnerSecureTarFile(
+            outer_tar=Mock(),
+            name=Mock(),
+            bufsize=1024,
+            derived_key_id=None,
+            gzip=False,
+            root_key_context=None,
+            **params,
+        )
+
+
 def test_securetarfile_validate_password_unencrypted(tmp_path: Path) -> None:
     """Test SecureTarFile.validate_password specify derived key without encryption."""
     main_tar = tmp_path.joinpath("test.tar")
@@ -1643,7 +1656,7 @@ def test_securetarfile_validate_password_unencrypted(tmp_path: Path) -> None:
             pass
     with SecureTarArchive(main_tar, "r") as archive:
         with archive.tar.extractfile("core.tar") as fileobj:
-            secure_tar_file = SecureTarFile(fileobj=fileobj, mode="r")
+            secure_tar_file = SecureTarFile(fileobj=fileobj)
             with pytest.raises(SecureTarError, match="File is not encrypted"):
                 secure_tar_file.validate_password()
 
@@ -1667,9 +1680,7 @@ def test_securetarfile_validate_password_after_open(tmp_path: Path) -> None:
             pass
     with SecureTarArchive(main_tar, "r") as archive:
         with archive.tar.extractfile("core.tar") as fileobj:
-            secure_tar_file = SecureTarFile(
-                fileobj=fileobj, mode="r", password="hunter2"
-            )
+            secure_tar_file = SecureTarFile(fileobj=fileobj, password="hunter2")
             with secure_tar_file:
                 with pytest.raises(SecureTarError, match="File is already open"):
                     secure_tar_file.validate_password()
@@ -1683,7 +1694,7 @@ def test_securetarfile_validate_unencrypted(tmp_path: Path) -> None:
             pass
     with SecureTarArchive(main_tar, "r") as archive:
         with archive.tar.extractfile("core.tar") as fileobj:
-            secure_tar_file = SecureTarFile(fileobj=fileobj, mode="r")
+            secure_tar_file = SecureTarFile(fileobj=fileobj)
             with pytest.raises(SecureTarError, match="File is not encrypted"):
                 secure_tar_file.validate()
 
@@ -1707,9 +1718,7 @@ def test_securetarfile_validate_after_open(tmp_path: Path) -> None:
             pass
     with SecureTarArchive(main_tar, "r") as archive:
         with archive.tar.extractfile("core.tar") as fileobj:
-            secure_tar_file = SecureTarFile(
-                fileobj=fileobj, mode="r", password="hunter2"
-            )
+            secure_tar_file = SecureTarFile(fileobj=fileobj, password="hunter2")
             with secure_tar_file:
                 with pytest.raises(SecureTarError, match="File is already open"):
                     secure_tar_file.validate()
@@ -1717,25 +1726,25 @@ def test_securetarfile_validate_after_open(tmp_path: Path) -> None:
 
 def test_securetarfile_path_fileobj() -> None:
     """Test SecureTarFile.path property when fileobj is used."""
-    secure_tar_file = SecureTarFile(fileobj=io.BytesIO(), mode="r")
+    secure_tar_file = SecureTarFile(fileobj=io.BytesIO())
     assert secure_tar_file.path is None
 
 
 def test_securetarfile_path_name() -> None:
     """Test SecureTarFile.path property when name is used."""
-    secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="r")
+    secure_tar_file = SecureTarFile(name=Path("test.tar"))
     assert secure_tar_file.path == Path("test.tar")
 
 
 def test_securetarfile_size_fileobj() -> None:
     """Test SecureTarFile.size property when fileobj is used."""
-    secure_tar_file = SecureTarFile(fileobj=io.BytesIO(), mode="r")
+    secure_tar_file = SecureTarFile(fileobj=io.BytesIO())
     assert secure_tar_file.size == 0
 
 
 def test_securetarfile_size_name() -> None:
     """Test SecureTarFile.size property when name is used."""
-    secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="r")
+    secure_tar_file = SecureTarFile(name=Path("test.tar"))
     assert secure_tar_file.size == 0.01
 
 

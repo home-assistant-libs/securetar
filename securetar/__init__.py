@@ -868,12 +868,11 @@ class SecureTarEncryptStream:
 class SecureTarFile:
     """Handle tar files, optionally wrapped in an encryption layer."""
 
-    supported_modes = (MOD_READ,)
+    _mode: str = "r"
 
     def __init__(
         self,
         name: Path | None = None,
-        mode: Literal["r"] = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
         create_version: int | None = None,
@@ -899,7 +898,7 @@ class SecureTarFile:
             root_key_context: Root key context to use for deriving key material. Mutually
             exclusive with password.
         """
-        if mode == MOD_READ:
+        if self._mode == MOD_READ:
             if create_version is not None:
                 raise ValueError("Version must be None when reading a SecureTar file")
         elif create_version is None:
@@ -917,11 +916,7 @@ class SecureTarFile:
         if name is None and fileobj is None:
             raise ValueError("Either filename or fileobj must be provided")
 
-        if mode not in self.supported_modes:
-            raise ValueError(f"Mode must be '{', '.join(self.supported_modes)}'")
-
         self._file: IO[bytes] | None = None
-        self._mode: str = mode
         self._name: Path | None = name
         self._bufsize: int = bufsize
         self._extra_tar_args: dict[str, Any] = {}
@@ -938,9 +933,9 @@ class SecureTarFile:
         # Determine the mode for tarfile.open(), streaming (|) for encrypted because
         # we can't seek in the ciphertext, normal (:) for plain
         if self._encrypted:
-            self._tar_mode = f"{mode}|"
+            self._tar_mode = f"{self._mode}|"
         else:
-            self._tar_mode = f"{mode}:"
+            self._tar_mode = f"{self._mode}:"
             if gzip:
                 self._extra_tar_args["compresslevel"] = 6
         if gzip:
@@ -1131,14 +1126,13 @@ class InnerSecureTarFile(SecureTarFile):
 
     _header_length: int
     _header_position: int
-    supported_modes = (MOD_WRITE,)
+    _mode: str = "w"
     _tar_info: tarfile.TarInfo
 
     def __init__(
         self,
         outer_tar: tarfile.TarFile,
         name: Path,
-        mode: Literal["w"],
         *,
         bufsize: int,
         derived_key_id: Hashable | None,
@@ -1149,7 +1143,6 @@ class InnerSecureTarFile(SecureTarFile):
         """Initialize inner handler."""
         super().__init__(
             name=name,
-            mode=mode,
             gzip=gzip,
             bufsize=bufsize,
             derived_key_id=derived_key_id,
@@ -1387,7 +1380,6 @@ class SecureTarArchive:
             self._tar,
             bufsize=self._bufsize,
             gzip=gzip,
-            mode="w",
             name=Path(name),
             create_version=self._create_version,
             derived_key_id=derived_key_id,
