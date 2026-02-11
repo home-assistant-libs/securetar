@@ -13,20 +13,52 @@ from pathlib import Path, PurePath
 from typing import Any
 from unittest.mock import Mock, patch
 
+import nacl
 import pytest
 
 from securetar import (
     SECURETAR_MAGIC,
+    SECURETAR_V2_HEADER_SIZE,
+    SECURETAR_V3_HEADER_SIZE,
+    V3_SECRETSTREAM_ABYTES,
+    V3_SECRETSTREAM_CHUNK_SIZE,
     AddFileError,
+    InvalidPasswordError,
     InnerSecureTarFile,
     SecureTarArchive,
     SecureTarError,
     SecureTarFile,
+    SecureTarHeader,
     SecureTarReadError,
     SecureTarRootKeyContext,
     atomic_contents_add,
     secure_path,
 )
+
+
+def get_ciphertext_size_v2(plaintext_size: int) -> int:
+    """Get expected ciphertext size for v2."""
+    # Padding to next 16 byte block
+    padding = 16 - (plaintext_size % 16)
+    return plaintext_size + padding + SECURETAR_V2_HEADER_SIZE
+
+
+def get_ciphertext_size_v3(plaintext_size: int) -> int:
+    """Get expected ciphertext size for v3."""
+    num_chunks = (
+        plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
+    ) // V3_SECRETSTREAM_CHUNK_SIZE
+    if num_chunks == 0:
+        num_chunks = 1
+    return (
+        plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES + SECURETAR_V3_HEADER_SIZE
+    )
+
+
+get_ciphertext_size: dict[int, Callable[[int], int]] = {
+    2: get_ciphertext_size_v2,
+    3: get_ciphertext_size_v3,
+}
 
 
 @dataclass
@@ -62,8 +94,22 @@ def test_not_secure_path() -> None:
     [
         (
             Mock(return_value=False),
-            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
-            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
+            {
+                ".",
+                "README.md",
+                "large_file",
+                "test_symlink",
+                "test1",
+                "test1/script.sh",
+            },
+            {
+                ".",
+                "README.md",
+                "large_file",
+                "test_symlink",
+                "test1",
+                "test1/script.sh",
+            },
         ),
         (
             Mock(return_value=True),
@@ -72,8 +118,15 @@ def test_not_secure_path() -> None:
         ),
         (
             Mock(wraps=lambda path: path.name == "README.md"),
-            {".", "README.md", "test_symlink", "test1", "test1/script.sh"},
-            {".", "test_symlink", "test1", "test1/script.sh"},
+            {
+                ".",
+                "README.md",
+                "large_file",
+                "test_symlink",
+                "test1",
+                "test1/script.sh",
+            },
+            {".", "large_file", "test_symlink", "test1", "test1/script.sh"},
         ),
     ],
 )
@@ -91,58 +144,23 @@ def test_file_filter(
 
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(temp_tar, "w") as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            file_filter=file_filter,
-            arcname=".",
-        )
+    with SecureTarArchive(temp_tar, "w") as archive:
+        with archive.create_tar("core.tar") as inner_tar_file:
+            atomic_contents_add(
+                inner_tar_file,
+                temp_orig,
+                file_filter=file_filter,
+                arcname=".",
+            )
     paths = [call[1][0] for call in file_filter.mock_calls]
     assert len(paths) == len(expected_filter_calls)
     assert set(paths) == {PurePath(path) for path in expected_filter_calls}
 
-    with SecureTarFile(temp_tar, "r") as tar_file:
-        members = {tar_info.name for tar_info in tar_file}
+    with SecureTarArchive(temp_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
+            with tarfile.open(fileobj=inner_tar_file_obj, mode="r") as inner_tar_file:
+                members = {tar_info.name for tar_info in inner_tar_file}
     assert members == expected_tar_items
-
-
-@pytest.mark.parametrize("bufsize", [10240, 4 * 2**20])
-def test_create_pure_tar(tmp_path: Path, bufsize: int) -> None:
-    """Test to create a tar file without encryption."""
-    # Prepare test folder
-    temp_orig = tmp_path.joinpath("orig")
-    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
-    shutil.copytree(fixture_data, temp_orig, symlinks=True)
-
-    # Create Tarfile
-    temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(temp_tar, "w", bufsize=bufsize) as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            file_filter=lambda _: False,
-            arcname=".",
-        )
-
-    assert temp_tar.exists()
-
-    # Restore
-    temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(temp_tar, "r", bufsize=bufsize) as tar_file:
-        tar_file.extractall(path=temp_new, members=tar_file)
-
-    assert temp_new.is_dir()
-    assert temp_new.joinpath("test_symlink").is_symlink()
-    assert temp_new.joinpath("test1").is_dir()
-    assert temp_new.joinpath("test1/script.sh").is_file()
-
-    # 775 is correct for local, but in GitHub action it's 755, both is fine
-    assert oct(temp_new.joinpath("test1/script.sh").stat().st_mode)[-3:] in [
-        "755",
-        "775",
-    ]
-    assert temp_new.joinpath("README.md").is_file()
 
 
 @pytest.mark.parametrize(
@@ -186,94 +204,28 @@ def test_create_with_error(
 
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
-    with (
-        patch.object(target, attribute, side_effect=OSError("Boom!")),
-        pytest.raises(
-            AddFileError,
-            match=expected_error.format(temp_orig=temp_orig),
-        ),
-        SecureTarFile(temp_tar, "w") as tar_file,
-    ):
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            file_filter=lambda _: False,
-            arcname=".",
-        )
+    with SecureTarArchive(temp_tar, "w") as archive:
+        with (
+            patch.object(target, attribute, side_effect=OSError("Boom!")),
+            pytest.raises(
+                AddFileError,
+                match=expected_error.format(temp_orig=temp_orig),
+            ),
+            archive.create_tar("core.tar") as inner_tar_file,
+        ):
+            atomic_contents_add(
+                inner_tar_file,
+                temp_orig,
+                file_filter=lambda _: False,
+                arcname=".",
+            )
 
 
 @pytest.mark.parametrize("bufsize", [333, 10240, 4 * 2**20])
 @pytest.mark.parametrize("enable_gzip", [True, False])
-def test_create_encrypted_tar(tmp_path: Path, bufsize: int, enable_gzip: bool) -> None:
-    """Test to create a tar file with encryption."""
-    password = "hunter2"
-
-    # Prepare test folder
-    temp_orig = tmp_path.joinpath("orig")
-    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
-    shutil.copytree(fixture_data, temp_orig, symlinks=True)
-    with open(temp_orig / "randbytes1", "wb") as file:
-        file.write(os.urandom(12345))
-    with open(temp_orig / "randbytes2", "wb") as file:
-        file.write(os.urandom(12345))
-
-    # Create Tarfile
-    temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(
-        temp_tar, "w", password=password, bufsize=bufsize, gzip=enable_gzip
-    ) as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            file_filter=lambda _: False,
-            arcname=".",
-        )
-
-    assert temp_tar.exists()
-
-    # Iterate over the tar file
-    files = set()
-    with SecureTarFile(
-        temp_tar, "r", password=password, bufsize=bufsize, gzip=enable_gzip
-    ) as tar_file:
-        for tar_info in tar_file:
-            files.add(tar_info.name)
-    assert files == {
-        ".",
-        "README.md",
-        "randbytes1",
-        "randbytes2",
-        "test_symlink",
-        "test1",
-        "test1/script.sh",
-    }
-
-    # Restore
-    temp_new = tmp_path.joinpath("new")
-    with SecureTarFile(
-        temp_tar, "r", password=password, bufsize=bufsize, gzip=enable_gzip
-    ) as tar_file:
-        tar_file.extractall(path=temp_new, members=tar_file)
-
-    assert temp_new.is_dir()
-    assert temp_new.joinpath("test_symlink").is_symlink()
-    assert temp_new.joinpath("test1").is_dir()
-    assert temp_new.joinpath("test1/script.sh").is_file()
-    assert temp_new.joinpath("randbytes1").is_file()
-    assert temp_new.joinpath("randbytes2").is_file()
-
-    # 775 is correct for local, but in GitHub action it's 755, both is fine
-    assert oct(temp_new.joinpath("test1/script.sh").stat().st_mode)[-3:] in [
-        "755",
-        "775",
-    ]
-    assert temp_new.joinpath("README.md").is_file()
-
-
-@pytest.mark.parametrize("bufsize", [333, 10240, 4 * 2**20])
-@pytest.mark.parametrize("enable_gzip", [True, False])
-def test_create_encrypted_tar_validate_password(
-    tmp_path: Path, bufsize: int, enable_gzip: bool
+@pytest.mark.parametrize("version", [2, 3])
+def test_create_encrypted_tar_validate(
+    tmp_path: Path, bufsize: int, enable_gzip: bool, version: int
 ) -> None:
     """Test to create a tar file with encryption."""
     password = "hunter2"
@@ -289,29 +241,74 @@ def test_create_encrypted_tar_validate_password(
 
     # Create Tarfile
     temp_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarFile(
-        temp_tar, "w", password=password, bufsize=bufsize, gzip=enable_gzip
-    ) as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            file_filter=lambda _: False,
-            arcname=".",
-        )
+    with SecureTarArchive(
+        temp_tar,
+        "w",
+        password=password,
+        bufsize=bufsize,
+        create_version=version,
+    ) as archive:
+        with archive.create_tar("core.tar", gzip=enable_gzip) as inner_tar_file:
+            atomic_contents_add(
+                inner_tar_file,
+                temp_orig,
+                file_filter=lambda _: False,
+                arcname=".",
+            )
 
     assert temp_tar.exists()
 
+    # Attempt to validate password with wrong password
+    with SecureTarArchive(temp_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
+            secure_tar_file = SecureTarFile(
+                None,
+                "r",
+                bufsize=bufsize,
+                fileobj=inner_tar_file_obj,
+                password="wrong_password",
+                gzip=enable_gzip,
+            )
+            assert not secure_tar_file.validate_password()
+
+    # Attempt to validate password with correct password
+    with SecureTarArchive(temp_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
+            secure_tar_file = SecureTarFile(
+                None,
+                "r",
+                bufsize=bufsize,
+                fileobj=inner_tar_file_obj,
+                password=password,
+                gzip=enable_gzip,
+            )
+            assert secure_tar_file.validate_password()
+
     # Attempt to validate with wrong password
-    secure_tar_file = SecureTarFile(
-        temp_tar, "r", bufsize=bufsize, password="wrong_password", gzip=enable_gzip
-    )
-    assert not secure_tar_file.validate_password()
+    with SecureTarArchive(temp_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
+            secure_tar_file = SecureTarFile(
+                None,
+                "r",
+                bufsize=bufsize,
+                fileobj=inner_tar_file_obj,
+                password="wrong_password",
+                gzip=enable_gzip,
+            )
+            assert not secure_tar_file.validate()
 
     # Attempt to validate with correct password
-    secure_tar_file = SecureTarFile(
-        temp_tar, "r", bufsize=bufsize, password=password, gzip=enable_gzip
-    )
-    assert secure_tar_file.validate_password()
+    with SecureTarArchive(temp_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as inner_tar_file_obj:
+            secure_tar_file = SecureTarFile(
+                None,
+                "r",
+                bufsize=bufsize,
+                fileobj=inner_tar_file_obj,
+                password=password,
+                gzip=enable_gzip,
+            )
+            assert secure_tar_file.validate()
 
 
 @patch("securetar.time.time", new=Mock(return_value=1765362043.0))
@@ -322,12 +319,14 @@ def test_create_encrypted_tar_validate_password(
         ("inner_file", lambda: SecureTarRootKeyContext("hunter2"), None, True),
     ],
 )
+@pytest.mark.parametrize("version", [2, 3])
 def test_create_encrypted_archive_fixed_nonce(
     tmp_path: Path,
     derived_key_id: Hashable | None,
     root_key_context_func: Callable[[str | None], SecureTarRootKeyContext],
     password: str | None,
     expect_same_content: bool,
+    version: int,
 ) -> None:
     """Test to create an archive with fixed nonce."""
     # Prepare test folder
@@ -346,6 +345,7 @@ def test_create_encrypted_archive_fixed_nonce(
     with SecureTarArchive(
         temp_tar1,
         "w",
+        create_version=version,
         password=password,
         root_key_context=root_key_context,
     ) as archive:
@@ -364,6 +364,7 @@ def test_create_encrypted_archive_fixed_nonce(
     with SecureTarArchive(
         temp_tar2,
         "w",
+        create_version=version,
         password=password,
         root_key_context=root_key_context,
     ) as archive:
@@ -388,12 +389,14 @@ def test_create_encrypted_archive_fixed_nonce(
         ("inner_file", lambda: SecureTarRootKeyContext("hunter2"), None, True),
     ],
 )
+@pytest.mark.parametrize("version", [2, 3])
 def test_encrypt_archive_fixed_nonce(
     tmp_path: Path,
     derived_key_id: Hashable | None,
     root_key_context_func: Callable[[str | None], SecureTarRootKeyContext],
     password: str | None,
     expect_same_content: bool,
+    version: int,
 ) -> None:
     """Test to encrypt a plaintext archive with fixed nonce."""
     # Prepare test folder
@@ -427,6 +430,7 @@ def test_encrypt_archive_fixed_nonce(
         SecureTarArchive(
             temp_tar1,
             "w",
+            create_version=version,
             password=password,
             root_key_context=root_key_context,
         ) as encrypted_archive,
@@ -448,6 +452,7 @@ def test_encrypt_archive_fixed_nonce(
         SecureTarArchive(
             temp_tar2,
             "w",
+            create_version=version,
             password=password,
             root_key_context=root_key_context,
         ) as encrypted_archive,
@@ -466,66 +471,6 @@ def test_encrypt_archive_fixed_nonce(
     assert expect_same_content == (temp_tar1.read_bytes() == temp_tar2.read_bytes())
 
 
-@patch("securetar.time.time", new=Mock(return_value=1765362043.0))
-@pytest.mark.parametrize(
-    ("create_cipher_context", "expect_same_content"),
-    [(False, False), (True, True)],
-)
-def test_create_encrypted_tar_fixed_nonce(
-    tmp_path: Path, create_cipher_context: bool, expect_same_content: bool
-) -> None:
-    """Test to create a tar file with fixed nonce."""
-    password = "hunter2"
-
-    # Prepare test folder
-    temp_orig = tmp_path.joinpath("orig")
-    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
-    shutil.copytree(fixture_data, temp_orig, symlinks=True)
-    with open(temp_orig / "randbytes1", "wb") as file:
-        file.write(os.urandom(12345))
-    with open(temp_orig / "randbytes2", "wb") as file:
-        file.write(os.urandom(12345))
-
-    derived_key_id = None
-    root_key_context = None
-
-    # Create Tarfile1
-    if create_cipher_context:
-        derived_key_id = "inner_file"
-        root_key_context = SecureTarRootKeyContext(password)
-    temp_tar1 = tmp_path.joinpath("backup1.tar")
-    with SecureTarFile(
-        temp_tar1,
-        "w",
-        derived_key_id=derived_key_id,
-        root_key_context=root_key_context,
-    ) as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            file_filter=lambda _: False,
-            arcname=".",
-        )
-
-    # Create Tarfile2
-    temp_tar2 = tmp_path.joinpath("backup2.tar")
-    with SecureTarFile(
-        temp_tar2,
-        "w",
-        derived_key_id=derived_key_id,
-        root_key_context=root_key_context,
-    ) as tar_file:
-        atomic_contents_add(
-            tar_file,
-            temp_orig,
-            file_filter=lambda _: False,
-            arcname=".",
-        )
-
-    same_content = temp_tar1.read_bytes() == temp_tar2.read_bytes()
-    assert same_content == expect_same_content
-
-
 @pytest.mark.parametrize(
     ("enable_gzip", "inner_tar_files"),
     [
@@ -533,8 +478,9 @@ def test_create_encrypted_tar_fixed_nonce(
         (False, ("core.tar", "core2.tar", "core3.tar")),
     ],
 )
+@pytest.mark.parametrize("version", [2, 3])
 def test_tar_inside_tar(
-    tmp_path: Path, enable_gzip: bool, inner_tar_files: tuple[str, ...]
+    tmp_path: Path, enable_gzip: bool, inner_tar_files: tuple[str, ...], version: int
 ) -> None:
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
@@ -543,7 +489,9 @@ def test_tar_inside_tar(
 
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
-    with SecureTarArchive(main_tar, "w") as outer_secure_tar_archive:
+    with SecureTarArchive(
+        main_tar, "w", create_version=version
+    ) as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_archive.create_tar(
                 inner_tar_file, gzip=enable_gzip
@@ -634,10 +582,12 @@ def test_tar_inside_tar(
         ),
     ],
 )
+@pytest.mark.parametrize("version", [2, 3])
 def test_inner_tar_header_format(
     tmp_path: Path,
     outer_tar_header_format: str,
     expected_result: AbstractContextManager[None],
+    version: int,
 ) -> None:
     """Test inner tar with different outer tar header formats."""
     # Create Tarfile
@@ -654,10 +604,12 @@ def test_inner_tar_header_format(
                 name=Path("inner.tar"),
                 derived_key_id=None,
                 root_key_context=None,
+                create_version=version,
             )
 
 
-def test_inner_tar_force_pax_header(tmp_path: Path) -> None:
+@pytest.mark.parametrize("version", [2, 3])
+def test_inner_tar_force_pax_header(tmp_path: Path, version: int) -> None:
     """Test inner tar forces PAX header format."""
     # Create Tarfile
     main_tar = tmp_path.joinpath("backup.tar")
@@ -670,6 +622,7 @@ def test_inner_tar_force_pax_header(tmp_path: Path) -> None:
             name=Path("inner.tar"),
             derived_key_id=None,
             root_key_context=None,
+            create_version=version,
         )
         with inner_tar as inner_tar_file:
             assert inner_tar_file.format == tarfile.PAX_FORMAT
@@ -684,8 +637,13 @@ def test_inner_tar_force_pax_header(tmp_path: Path) -> None:
         (False, ("core.tar", "core2.tar", "core3.tar")),
     ],
 )
+@pytest.mark.parametrize("version", [2, 3])
 def test_tar_inside_tar_encrypt(
-    tmp_path: Path, bufsize: int, enable_gzip: bool, inner_tar_files: tuple[str, ...]
+    tmp_path: Path,
+    bufsize: int,
+    enable_gzip: bool,
+    inner_tar_files: tuple[str, ...],
+    version: int,
 ) -> None:
     """Test we can make encrypted versions of plaintext tars."""
 
@@ -742,6 +700,7 @@ def test_tar_inside_tar_encrypt(
             mode="w",
             password=password,
             bufsize=bufsize,
+            create_version=version,
             streaming=True,
         ) as encrypted_archive,
         SecureTarArchive(
@@ -763,18 +722,25 @@ def test_tar_inside_tar_encrypt(
         for inner_tar_file in inner_tar_files:
             encrypted_tar_info = encrypted_archive.tar.getmember(inner_tar_file)
             plain_tar_info = plain_archive.tar.getmember(inner_tar_file)
-            assert (
-                encrypted_tar_info.size
-                == plain_tar_info.size + 16 - plain_tar_info.size % 16 + 16 + 32
+            assert encrypted_tar_info.size == get_ciphertext_size[version](
+                plain_tar_info.size
             )
 
     # Check the encrypted inner tars can be opened
     temp_decrypted = tmp_path.joinpath("decrypted")
     os.makedirs(temp_decrypted, exist_ok=True)
-    with SecureTarArchive(main_tar_encrypted, password=password) as encrypted_archive:
+    with (
+        SecureTarArchive(main_tar_encrypted, password=password) as encrypted_archive,
+        SecureTarArchive(main_tar, "r", bufsize=bufsize) as plain_archive,
+    ):
         for inner_tar_file in inner_tar_files:
             encrypted_tar_info = encrypted_archive.tar.getmember(inner_tar_file)
             with encrypted_archive.extract_tar(encrypted_tar_info) as decrypted:
+                # Check DecryptReader.plaintext_size is correct
+                assert (
+                    decrypted.plaintext_size
+                    == plain_archive.tar.getmember(inner_tar_file).size
+                )
                 decrypted_inner_tar_path = temp_decrypted.joinpath(inner_tar_file)
                 with open(decrypted_inner_tar_path, "wb") as file:
                     while data := decrypted.read(bufsize):
@@ -794,6 +760,7 @@ def test_tar_inside_tar_encrypt(
             assert files == {
                 ".",
                 "README.md",
+                "large_file",
                 "test1",
                 "test1/script.sh",
                 "test_symlink",
@@ -876,8 +843,13 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
         (False, ("core.tar", "core2.tar", "core3.tar")),
     ],
 )
+@pytest.mark.parametrize("version", [2, 3])
 def test_encrypted_tar_inside_tar(
-    tmp_path: Path, bufsize: int, enable_gzip: bool, inner_tar_files: tuple[str, ...]
+    tmp_path: Path,
+    bufsize: int,
+    enable_gzip: bool,
+    inner_tar_files: tuple[str, ...],
+    version: int,
 ) -> None:
     password = "hunter2"
 
@@ -889,7 +861,7 @@ def test_encrypted_tar_inside_tar(
     # Create an archive with encrypted inner tars
     main_tar = tmp_path.joinpath("backup.tar")
     with SecureTarArchive(
-        main_tar, "w", bufsize=bufsize, password=password
+        main_tar, "w", bufsize=bufsize, create_version=version, password=password
     ) as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_archive.create_tar(
@@ -912,6 +884,8 @@ def test_encrypted_tar_inside_tar(
         for tar_info in outer_secure_tar_archive.tar:
             inner_tar = outer_secure_tar_archive.tar.extractfile(tar_info)
             assert inner_tar.read(len(SECURETAR_MAGIC)) == SECURETAR_MAGIC
+            # Skip version and reserved bytes
+            inner_tar.read(7)
             file_sizes[tar_info.name] = int.from_bytes(inner_tar.read(8), "big")
     assert set(file_sizes) == {*inner_tar_files}
 
@@ -924,10 +898,9 @@ def test_encrypted_tar_inside_tar(
         for tar_info in outer_secure_tar_archive.tar:
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
-                with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
-                    with pytest.raises(
-                        SecureTarReadError, match="The inner tar is not gzip or tar"
-                    ):
+                # TODO: Check SecureTarReadError message
+                with pytest.raises((SecureTarReadError, InvalidPasswordError)):
+                    with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
                         while data := decrypted.read(bufsize):
                             file.write(data)
 
@@ -941,6 +914,8 @@ def test_encrypted_tar_inside_tar(
             inner_tar_path = temp_decrypted.joinpath(tar_info.name)
             with open(inner_tar_path, "wb") as file:
                 with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
+                    # Check DecryptReader.plaintext_size is correct
+                    assert decrypted.plaintext_size == file_sizes[tar_info.name]
                     while data := decrypted.read(bufsize):
                         file.write(data)
 
@@ -961,6 +936,7 @@ def test_encrypted_tar_inside_tar(
             assert files == {
                 ".",
                 "README.md",
+                "large_file",
                 "test1",
                 "test1/script.sh",
                 "test_symlink",
@@ -1009,8 +985,13 @@ def test_encrypted_tar_inside_tar(
         (False, ("core.tar", "core2.tar", "core3.tar")),
     ],
 )
-def test_encrypted_tar_inside_tar_validate_password(
-    tmp_path: Path, bufsize: int, enable_gzip: bool, inner_tar_files: tuple[str, ...]
+@pytest.mark.parametrize("version", [2, 3])
+def test_encrypted_tar_inside_tar_validate(
+    tmp_path: Path,
+    bufsize: int,
+    enable_gzip: bool,
+    inner_tar_files: tuple[str, ...],
+    version: int,
 ) -> None:
     password = "hunter2"
 
@@ -1022,7 +1003,7 @@ def test_encrypted_tar_inside_tar_validate_password(
     # Create an archive with encrypted inner tars
     main_tar = tmp_path.joinpath("backup.tar")
     with SecureTarArchive(
-        main_tar, "w", bufsize=bufsize, password=password
+        main_tar, "w", bufsize=bufsize, create_version=version, password=password
     ) as outer_secure_tar_archive:
         for inner_tar_file in inner_tar_files:
             with outer_secure_tar_archive.create_tar(
@@ -1053,6 +1034,81 @@ def test_encrypted_tar_inside_tar_validate_password(
         for tar_info in outer_secure_tar_archive.tar:
             assert outer_secure_tar_archive.validate_password(tar_info)
 
+    # Attempt to validate the inner tars with wrong password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate(tar_info)
+
+    # Attempt to validate the inner tars with correct password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert outer_secure_tar_archive.validate(tar_info)
+
+
+@pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("main_tar_file", "password_validation_result"),
+    [
+        # Files where the beginning of the file is correct, but there's a
+        # secretstream error later in the file. We expect password validation
+        # to succeed.
+        ("backup_no_final_tag.tar", True),
+        ("backup_truncated.tar", True),
+        # Files where there's a secretstream error already in the first block,
+        # we expect password validation to fail.
+        ("backup_early_final_tag.tar", False),
+        ("backup_empty.tar", False),
+    ],
+)
+def test_encrypted_tar_inside_tar_validate_secretstream_errors(
+    bufsize: int,
+    main_tar_file: str,
+    password_validation_result: bool,
+) -> None:
+    password = "hunter2"
+
+    fixture_path = Path(__file__).parent.joinpath("fixtures")
+    main_tar = fixture_path.joinpath(f"./{main_tar_file}")
+
+    # Attempt to validate the inner tars with wrong password, we always expect
+    # this to fail
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate_password(tar_info)
+
+    # Attempt to validate the inner tars with correct password
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert (
+                outer_secure_tar_archive.validate_password(tar_info)
+                == password_validation_result
+            )
+
+    # Attempt to validate the inner tars with wrong password, we always expect
+    # this to fail
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password="wrong_password", streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate(tar_info)
+
+    # Attempt to validate the inner tars with correct password. All the fixtures
+    # have some kind of secretstream error, so we expect validation to fail for
+    # all of them.
+    with SecureTarArchive(
+        main_tar, "r", bufsize=bufsize, password=password, streaming=True
+    ) as outer_secure_tar_archive:
+        for tar_info in outer_secure_tar_archive.tar:
+            assert not outer_secure_tar_archive.validate(tar_info)
+
 
 @pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
 def test_encrypted_gzipped_tar_inside_tar_legacy_format(
@@ -1082,7 +1138,7 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
     with (
         # The fixture was created when passing a key directly, so we mock the key
         patch(
-            "securetar.SecureTarRootKeyContext._password_to_key",
+            "securetar.KeyDerivationV2._password_to_key",
             return_value=b"0123456789abcdef",
         ),
         SecureTarArchive(
@@ -1140,6 +1196,113 @@ def test_encrypted_gzipped_tar_inside_tar_legacy_format(
             }
 
 
+@pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("archive", "inner_tar", "expected_exception", "expected_message"),
+    [
+        (
+            "backup_early_final_tag.tar",
+            "core_early_final_tag.tar.gz",
+            SecureTarError,
+            "Unexpected final tag in secretstream decryption",
+        ),
+        (
+            "backup_no_final_tag.tar",
+            "core_no_final_tag.tar.gz",
+            SecureTarError,
+            "Missing final tag in secretstream decryption",
+        ),
+        (
+            "backup_empty.tar",
+            "core_empty.tar.gz",
+            nacl.exceptions.ValueError,
+            "Ciphertext is too short",
+        ),
+        (
+            "backup_truncated.tar",
+            "core_truncated.tar.gz",
+            nacl.exceptions.RuntimeError,
+            "Unexpected failure",
+        ),
+    ],
+)
+def test_archive_secretstream_errors(
+    tmp_path: Path,
+    bufsize: int,
+    archive: str,
+    inner_tar: str,
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    password = "hunter2"
+
+    fixture_path = Path(__file__).parent.joinpath("fixtures")
+    main_tar = fixture_path.joinpath(archive)
+
+    # Attempt decrypting the inner tar
+    with (
+        SecureTarArchive(
+            main_tar, "r", bufsize=bufsize, password=password
+        ) as outer_secure_tar_archive,
+    ):
+        tar_info = outer_secure_tar_archive.tar.getmember(inner_tar)
+        with outer_secure_tar_archive.extract_tar(tar_info) as decrypted:
+            with pytest.raises(expected_exception, match=expected_message):
+                while decrypted.read(bufsize):
+                    pass
+
+
+@pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("tar_name", "expected_exception", "expected_message"),
+    [
+        (
+            "core_early_final_tag.tar.gz",
+            SecureTarError,
+            "Unexpected final tag in secretstream decryption",
+        ),
+        (
+            "core_no_final_tag.tar.gz",
+            SecureTarError,
+            "Missing final tag in secretstream decryption",
+        ),
+        (
+            "core_empty.tar.gz",
+            nacl.exceptions.ValueError,
+            "Ciphertext is too short",
+        ),
+        (
+            "core_truncated.tar.gz",
+            nacl.exceptions.RuntimeError,
+            "Unexpected failure",
+        ),
+    ],
+)
+def test_secretstream_errors(
+    tmp_path: Path,
+    bufsize: int,
+    tar_name: str,
+    expected_exception: type[Exception],
+    expected_message: str,
+) -> None:
+    password = "hunter2"
+
+    fixture_path = Path(__file__).parent.joinpath("fixtures")
+    tar_path = fixture_path.joinpath(tar_name)
+
+    # Attempt decrypting the inner tar
+    temp_decrypted = tmp_path.joinpath("decrypted")
+    os.makedirs(temp_decrypted, exist_ok=True)
+    with pytest.raises(expected_exception, match=expected_message):
+        with SecureTarFile(tar_path, "r", bufsize=bufsize, password=password) as tar:
+            for tar_info in tar:
+                if not tar_info.size:
+                    continue
+                with tar.extractfile(tar_info) as file:
+                    while file.read(bufsize):
+                        pass
+
+
 def test_outer_tar_open_close(tmp_path: Path) -> None:
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
@@ -1182,14 +1345,29 @@ def test_outer_tar_exclusive_mode(tmp_path: Path) -> None:
 
     assert main_tar.exists()
 
-    outer_secure_tar_file = SecureTarFile(main_tar, "x", gzip=False)
+    outer_secure_tar_archive = SecureTarArchive(main_tar, "x")
     with pytest.raises(FileExistsError):
-        outer_secure_tar_file.open()
+        outer_secure_tar_archive.open()
 
 
 @pytest.mark.parametrize(
     ("params", "expected_exception", "expected_message"),
     [
+        (
+            {"create_version": 1},
+            ValueError,
+            "Version must be None when reading a SecureTar file",
+        ),
+        (
+            {"create_version": 1, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 1",
+        ),
+        (
+            {"create_version": 4, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 4",
+        ),
         (
             {"password": "hunter2", "root_key_context": SecureTarRootKeyContext("abc")},
             ValueError,
@@ -1374,9 +1552,57 @@ def test_securetararchive_validate_password_unencrypted(tmp_path: Path) -> None:
             secure_tar_archive.validate_password(tarinfo)
 
 
+def test_securetararchive_validate_before_open() -> None:
+    """Test SecureTarArchive.validate call before open."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.validate(tarinfo)
+
+
+def test_securetararchive_validate_write_mode() -> None:
+    """Test SecureTarArchive.validate in write mode."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="w")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="Archive not open for reading"):
+            secure_tar_archive.validate(tarinfo)
+
+
+def test_securetararchive_validate_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarArchive.validate specify derived key without encryption."""
+    tarinfo = tarfile.TarInfo("any.tgz")
+    tarinfo.size = 1234
+    main_tar = tmp_path.joinpath("test.tar")
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="w")
+    with secure_tar_archive:
+        pass
+    secure_tar_archive = SecureTarArchive(name=main_tar, mode="r")
+    with secure_tar_archive:
+        with pytest.raises(SecureTarError, match="No password provided"):
+            secure_tar_archive.validate(tarinfo)
+
+
 @pytest.mark.parametrize(
     ("params", "expected_exception", "expected_message"),
     [
+        (
+            {"create_version": 1},
+            ValueError,
+            "Version must be None when reading a SecureTar file",
+        ),
+        (
+            {"create_version": 1, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 1",
+        ),
+        (
+            {"create_version": 4, "mode": "w"},
+            ValueError,
+            "Unsupported SecureTar version: 4",
+        ),
         (
             {"derived_key_id": "123"},
             ValueError,
@@ -1395,7 +1621,7 @@ def test_securetararchive_validate_password_unencrypted(tmp_path: Path) -> None:
         (
             {"name": "test.tar", "mode": "invalid_mode"},
             ValueError,
-            "Mode must be 'x', 'r', or 'w'",
+            "Mode must be 'r'",
         ),
     ],
 )
@@ -1412,35 +1638,81 @@ def test_securetarfile_error_handling(
 def test_securetarfile_validate_password_unencrypted(tmp_path: Path) -> None:
     """Test SecureTarFile.validate_password specify derived key without encryption."""
     main_tar = tmp_path.joinpath("test.tar")
-    secure_tar_file = SecureTarFile(name=main_tar, mode="w")
-    with secure_tar_file:
-        pass
-    secure_tar_file = SecureTarFile(name=main_tar, mode="r")
-    with secure_tar_file:
-        with pytest.raises(SecureTarError, match="File is not encrypted"):
-            secure_tar_file.validate_password()
+    with SecureTarArchive(main_tar, "w") as archive:
+        with archive.create_tar("core.tar"):
+            pass
+    with SecureTarArchive(main_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as fileobj:
+            secure_tar_file = SecureTarFile(fileobj=fileobj, mode="r")
+            with pytest.raises(SecureTarError, match="File is not encrypted"):
+                secure_tar_file.validate_password()
 
 
-def test_securetarfile_validate_password_write_mode() -> None:
+def test_securetarfile_validate_password_write_mode(tmp_path: Path) -> None:
     """Test SecureTarFile.validate_password in write mode."""
-    secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="w", password="hunter2")
-    with secure_tar_file:
+    main_tar = tmp_path.joinpath("test.tar")
+    with SecureTarArchive(main_tar, "w", password="hunter2") as archive:
+        inner_tar = archive.create_tar("core.tar")
         with pytest.raises(
             SecureTarError, match="Can only validate password in read mode"
         ):
-            secure_tar_file.validate_password()
+            inner_tar.validate_password()
 
 
 def test_securetarfile_validate_password_after_open(tmp_path: Path) -> None:
     """Test SecureTarFile.validate_password call after open."""
     main_tar = tmp_path.joinpath("test.tar")
-    secure_tar_file = SecureTarFile(name=main_tar, mode="w", password="hunter2")
-    with secure_tar_file:
-        pass
-    secure_tar_file = SecureTarFile(name=main_tar, mode="r", password="hunter2")
-    with secure_tar_file:
-        with pytest.raises(SecureTarError, match="File is already open"):
-            secure_tar_file.validate_password()
+    with SecureTarArchive(main_tar, "w", password="hunter2") as archive:
+        with archive.create_tar("core.tar"):
+            pass
+    with SecureTarArchive(main_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as fileobj:
+            secure_tar_file = SecureTarFile(
+                fileobj=fileobj, mode="r", password="hunter2"
+            )
+            with secure_tar_file:
+                with pytest.raises(SecureTarError, match="File is already open"):
+                    secure_tar_file.validate_password()
+
+
+def test_securetarfile_validate_unencrypted(tmp_path: Path) -> None:
+    """Test SecureTarFile.validate specify derived key without encryption."""
+    main_tar = tmp_path.joinpath("test.tar")
+    with SecureTarArchive(main_tar, "w") as archive:
+        with archive.create_tar("core.tar"):
+            pass
+    with SecureTarArchive(main_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as fileobj:
+            secure_tar_file = SecureTarFile(fileobj=fileobj, mode="r")
+            with pytest.raises(SecureTarError, match="File is not encrypted"):
+                secure_tar_file.validate()
+
+
+def test_securetarfile_validate_write_mode(tmp_path: Path) -> None:
+    """Test SecureTarFile.validate in write mode."""
+    main_tar = tmp_path.joinpath("test.tar")
+    with SecureTarArchive(main_tar, "w", password="hunter2") as archive:
+        inner_tar = archive.create_tar("core.tar")
+        with pytest.raises(
+            SecureTarError, match="Can only validate password in read mode"
+        ):
+            inner_tar.validate()
+
+
+def test_securetarfile_validate_after_open(tmp_path: Path) -> None:
+    """Test SecureTarFile.validate call after open."""
+    main_tar = tmp_path.joinpath("test.tar")
+    with SecureTarArchive(main_tar, "w", password="hunter2") as archive:
+        with archive.create_tar("core.tar"):
+            pass
+    with SecureTarArchive(main_tar, "r") as archive:
+        with archive.tar.extractfile("core.tar") as fileobj:
+            secure_tar_file = SecureTarFile(
+                fileobj=fileobj, mode="r", password="hunter2"
+            )
+            with secure_tar_file:
+                with pytest.raises(SecureTarError, match="File is already open"):
+                    secure_tar_file.validate()
 
 
 def test_securetarfile_path_fileobj() -> None:
@@ -1465,3 +1737,39 @@ def test_securetarfile_size_name() -> None:
     """Test SecureTarFile.size property when name is used."""
     secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="r")
     assert secure_tar_file.size == 0.01
+
+
+def test_securetarfile_v1_fallback() -> None:
+    """Test SecureTarFile with invalid magic."""
+    header_data = b"invalid magicabc"
+    header = SecureTarHeader.from_bytes(io.BytesIO(header_data))
+    assert header.version == 1
+    assert header.cipher_initialization == header_data
+
+
+@pytest.mark.parametrize(
+    ("header", "expected_exception", "expected_message"),
+    [
+        (
+            b"SecureTar\x01\x00\x00\x00\x00\x00\x00",
+            ValueError,
+            "Unsupported SecureTar version: 1",
+        ),
+        (
+            b"SecureTar\x04\x00\x00\x00\x00\x00\x00",
+            ValueError,
+            "Unsupported SecureTar version: 4",
+        ),
+        (
+            b"SecureTar\x02\x00\x00\x00\x00\x00\x01",
+            ValueError,
+            "Invalid reserved bytes in SecureTar header",
+        ),
+    ],
+)
+def test_securetarfile_invalid_magic(
+    header, expected_exception, expected_message
+) -> None:
+    """Test SecureTarFile with invalid magic."""
+    with pytest.raises(expected_exception, match=expected_message):
+        SecureTarHeader.from_bytes(io.BytesIO(header))

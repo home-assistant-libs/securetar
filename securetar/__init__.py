@@ -2,36 +2,109 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Hashable
 import copy
-from dataclasses import dataclass
 import enum
 import hashlib
+import hmac
 import logging
 import os
+import struct
 import tarfile
 import time
 from pathlib import Path, PurePath
+from types import NoneType
 from typing import TYPE_CHECKING, Any, IO, BinaryIO, Literal
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import (
     Cipher,
-    CipherContext,
     algorithms,
     modes,
 )
+import nacl.bindings.crypto_secretstream as nss
+from nacl.bindings.crypto_secretstream import (
+    crypto_secretstream_xchacha20poly1305_TAG_FINAL as NSS_TAG_FINAL,
+    crypto_secretstream_xchacha20poly1305_TAG_MESSAGE as NSS_TAG_MESSAGE,
+)
+import nacl.encoding
+from nacl.exceptions import CryptoError
+from nacl.hash import blake2b
+from nacl.pwhash.argon2id import kdf, SALTBYTES as ARGON2_SALT_SIZE
+from nacl.utils import random as nacl_random
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-BLOCK_SIZE = 16
-BLOCK_SIZE_BITS = 128
-IV_SIZE = BLOCK_SIZE
+# Sizes for AES, used in v1 and v2
+AES_BLOCK_SIZE = 16
+AES_BLOCK_SIZE_BITS = 128
+AES_IV_SIZE = AES_BLOCK_SIZE
+
+# Sizes for v3
+V3_SECRETSTREAM_ABYTES = nss.crypto_secretstream_xchacha20poly1305_ABYTES
+V3_SECRETSTREAM_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+V3_KDF_OPSLIMIT = 8
+V3_KDF_MEMLIMIT = 16 * 1024 * 1024  # 16 MiB
+V3_DERIVED_KEY_SIZE = 32
+V3_DERIVED_KEY_SALT_SIZE = 16
+V3_CHACHA20_HEADER_SIZE = nss.crypto_secretstream_xchacha20poly1305_HEADERBYTES
+
 DEFAULT_BUFSIZE = 10240
 
-SECURETAR_MAGIC = b"SecureTar\x02\x00\x00\x00\x00\x00\x00"
-SECURETAR_HEADER_SIZE = len(SECURETAR_MAGIC) + 16
+# The initial header consists of 16 bytes of magic, version, reserved.
+# The 16 bytes size is chosen to align with v1 which has no magic, just 16 byte AES IV.
+SECURETAR_MAGIC = b"SecureTar"
+SECURETAR_MAGIC_RESERVED = b"\x00" * 6
+
+# SecureTar v1 header consists of:
+# 0 bytes file ID (no magic)
+# 0 bytes file metadata (no metadata)
+# 16 bytes AES IV
+SECURETAR_LEGACY_HEADER_SIZE = AES_IV_SIZE
+
+# Securetar file ID and metadata formats used in v2 and v3:
+# 16 bytes file ID: 9 bytes magic + 1 byte version + 6 bytes reserved
+# 16 bytes file metadata: 8 bytes plaintext size + 8 bytes reserved
+SECURETAR_FILE_ID_FORMAT = "!9sB6s"
+SECURETAR_FILE_METADATA_FORMAT = "!Q8x"
+
+# SecureTar v2 header consists of:
+# 32 bytes file ID + metadata
+# 16 bytes AES IV
+# Note: The reserved bytes are currently unused and written as \x00. The reserved
+# bytes in the file ID must be zero when reading. The reserved bytes in the file
+# metadata are ignored when reading.
+SECURETAR_V2_CIPHER_INIT_SIZE = AES_IV_SIZE
+SECURETAR_V2_HEADER_SIZE = (
+    struct.calcsize(SECURETAR_FILE_ID_FORMAT)
+    + struct.calcsize(SECURETAR_FILE_METADATA_FORMAT)
+    + SECURETAR_V2_CIPHER_INIT_SIZE
+)
+
+# SecureTar v3 header consists of:
+# 16 bytes file ID: 9 bytes magic + 1 byte version + 6 bytes reserved
+# 16 bytes file metadata: 8 bytes plaintext size + 8 bytes reserved
+# 104 bytes cipher initialization:
+#  - 16 bytes root salt
+#  - 16 bytes validation salt
+#  - 32 bytes validation key
+#  - 16 bytes validation salt
+#  - 24 bytes cipher header + nonce
+SECURETAR_V3_CIPHER_INIT_FORMAT = (
+    f"!{ARGON2_SALT_SIZE}s"  # Root salt
+    f"{V3_DERIVED_KEY_SALT_SIZE}s"  # Validation key salt
+    f"{V3_DERIVED_KEY_SIZE}s"  # Validation derived key
+    f"{V3_DERIVED_KEY_SALT_SIZE}s"  # Secret stream key salt
+    f"{V3_CHACHA20_HEADER_SIZE}s"  # Cipher header + nonce (24 bytes)
+)
+SECURETAR_V3_CIPHER_INIT_SIZE = struct.calcsize(SECURETAR_V3_CIPHER_INIT_FORMAT)
+SECURETAR_V3_HEADER_SIZE = (
+    struct.calcsize(SECURETAR_FILE_ID_FORMAT)
+    + struct.calcsize(SECURETAR_FILE_METADATA_FORMAT)
+    + SECURETAR_V3_CIPHER_INIT_SIZE
+)
 
 GZIP_MAGIC_BYTES = b"\x1f\x8b\x08"
 TAR_MAGIC_BYTES = b"ustar"
@@ -42,6 +115,8 @@ TAR_BLOCK_SIZE = 512
 MOD_EXCLUSIVE = "x"
 MOD_READ = "r"
 MOD_WRITE = "w"
+
+DEFAULT_CIPHER_VERSION = 3
 
 
 class CipherMode(enum.Enum):
@@ -58,34 +133,72 @@ class SecureTarHeader:
     format used in earlier releases of SecureTar.
     """
 
-    def __init__(self, cbc_rand: bytes, plaintext_size: int | None) -> None:
+    def __init__(
+        self, cipher_initialization: bytes, plaintext_size: int | None, version: int
+    ) -> None:
         """Initialize SecureTar header."""
-        self.cbc_rand = cbc_rand
+        self.cipher_initialization = cipher_initialization
         self.plaintext_size = plaintext_size
+        if version not in (1, 2, 3):
+            raise ValueError(f"Unsupported SecureTar version: {version}")
+        self.version = version
+
+        if version == 1:
+            self.size = SECURETAR_LEGACY_HEADER_SIZE
+        elif version == 2:
+            self.size = SECURETAR_V2_HEADER_SIZE
+        else:
+            self.size = SECURETAR_V3_HEADER_SIZE
 
     @classmethod
     def from_bytes(cls, f: IO[bytes]) -> SecureTarHeader:
-        """Return header bytes."""
-        header = f.read(len(SECURETAR_MAGIC))
+        """Create from bytes."""
+        # Read magic, version (1 byte), reserved
+        header = f.read(struct.calcsize(SECURETAR_FILE_ID_FORMAT))
         plaintext_size: int | None = None
-        if header != SECURETAR_MAGIC:
-            cbc_rand = header
-        else:
-            plaintext_size = int.from_bytes(f.read(8), "big")
-            f.read(8)  # Skip reserved bytes
-            cbc_rand = f.read(IV_SIZE)
+        magic, version, reserved = struct.unpack(SECURETAR_FILE_ID_FORMAT, header)
+        if magic == SECURETAR_MAGIC:
+            # Magic matches, assume SecureTar v2+
+            if version not in (2, 3):
+                raise ValueError(f"Unsupported SecureTar version: {version}")
+            if reserved != SECURETAR_MAGIC_RESERVED:
+                raise ValueError("Invalid reserved bytes in SecureTar header")
 
-        return cls(cbc_rand, plaintext_size)
+            file_metadata = f.read(struct.calcsize(SECURETAR_FILE_METADATA_FORMAT))
+            # Valid SecureTar v2+ header, read rest of header: plaintext size + reserved
+            (plaintext_size,) = struct.unpack(
+                SECURETAR_FILE_METADATA_FORMAT, file_metadata
+            )
+            if version == 2:
+                cipher_initialization = f.read(SECURETAR_V2_CIPHER_INIT_SIZE)
+            else:
+                cipher_initialization = f.read(SECURETAR_V3_CIPHER_INIT_SIZE)
+        else:
+            # Assume legacy format without magic
+            cipher_initialization = header
+            version = 1
+
+        return cls(cipher_initialization, plaintext_size, version)
 
     def to_bytes(self) -> bytes:
         """Return header bytes."""
         if self.plaintext_size is None:
             raise ValueError("Plaintext size is required")
+        # Check version.
+        # SecureTar versions writing v1 had bugs related to how the padding was
+        # handled, and we don't support creating such archives anymore.
+        if self.version not in (2, 3):
+            raise ValueError(f"Unsupported SecureTar version: {self.version}")
+
         return (
-            SECURETAR_MAGIC
-            + self.plaintext_size.to_bytes(8, "big")
-            + bytes(8)
-            + self.cbc_rand
+            struct.pack(
+                SECURETAR_FILE_ID_FORMAT,
+                SECURETAR_MAGIC,
+                self.version,
+                SECURETAR_MAGIC_RESERVED,
+            )
+            + struct.pack(SECURETAR_FILE_METADATA_FORMAT, self.plaintext_size)
+            + self.cipher_initialization
         )
 
 
@@ -102,6 +215,10 @@ class AddFileError(SecureTarError):
         super().__init__(*args)
 
 
+class InvalidPasswordError(SecureTarError):
+    """SecureTar invalid password error."""
+
+
 class SecureTarReadError(SecureTarError):
     """SecureTar read error."""
 
@@ -116,363 +233,638 @@ def _is_valid_tar_header(data: bytes) -> bool:
     return is_gzip or is_tar
 
 
-class _CipherIO:
-    """Base class for SecureTar cipher operations."""
+class CipherStream(ABC):
+    """Abstract base for cipher stream operations."""
 
-    def __init__(
-        self,
-        cipher_mode: CipherMode,
-        *,
-        root_key_context: SecureTarRootKeyContext,
-        derived_key_id: Hashable | None,
-    ) -> None:
-        self._cipher_mode = cipher_mode
-        self._root_key_context = root_key_context
-        self._derived_key_id = derived_key_id
-
-        self._cipher: CipherContext | None = None
-        self._padder: padding.PaddingContext | None = None
-        self.securetar_header: SecureTarHeader | None = None
-        self.padding_length = 0
-
-    def _open_for_decrypt(self, source: IO[bytes]) -> None:
-        """Initialize cipher for decryption."""
-        self.securetar_header = SecureTarHeader.from_bytes(source)
-        derived_key_material = self._root_key_context.restore_key_material(
-            header=self.securetar_header
-        )
-        self._setup_cipher(derived_key_material)
-
-    def _open_for_encrypt(self, plaintext_size: int | None) -> None:
-        """Initialize cipher for encryption."""
-        derived_key_material = self._root_key_context.derive_key_material(
-            self._derived_key_id
-        )
-        self.securetar_header = SecureTarHeader(
-            derived_key_material.nonce,
-            plaintext_size,
-        )
-        self._setup_cipher(derived_key_material)
-
-    def _setup_cipher(self, derived_key_material: SecureTarDerivedKeyMaterial) -> None:
-        key = derived_key_material.key
-        iv = derived_key_material.iv
-        aes = Cipher(
-            algorithms.AES(key),
-            modes.CBC(iv),
-            backend=default_backend(),
-        )
-        if self._cipher_mode == CipherMode.DECRYPT:
-            self._cipher = aes.decryptor()
-        else:
-            self._cipher = aes.encryptor()
-        self._padder = padding.PKCS7(BLOCK_SIZE_BITS).padder()
-
-    def finalize_padding(self) -> bytes:
-        """Return final padding block.
-
-        Can only be called once.
-        """
-        if not self._cipher or not self._padder:
-            raise SecureTarError("Cipher not initialized")
-        if self._cipher_mode == CipherMode.ENCRYPT:
-            padding_data = self._padder.finalize()
-            self.padding_length = len(padding_data)
-            self._padder = None  # Mark as finalized
-            return self._cipher.update(padding_data)
-        return b""
-
+    @abstractmethod
     def close(self) -> None:
-        """Mark as closed."""
-        self._cipher = None
-        self._padder = None
+        """Close the stream."""
 
 
-class _CipherReader(_CipherIO):
-    """Reads from a stream and encrypts or decrypts."""
+class CipherReader(CipherStream):
+    """Abstract base for cipher readers with buffered read."""
+
+    def __init__(self, source: IO[bytes], ciphertext_size: int | None = None) -> None:
+        """Initialize cipher reader."""
+        self._buffer = b""
+        self._ciphertext_size = ciphertext_size
+        self._done = False
+        self._source = source
+
+    def read(self, size: int = 0) -> bytes:
+        """Read data from buffer, filling as needed."""
+        if not self._done:
+            self._fill_buffer(size)
+
+        data = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return data
+
+    @abstractmethod
+    def _fill_buffer(self, size: int) -> None:
+        """Fill buffer with at least size bytes if possible."""
+
+
+class DecryptReader(CipherReader):
+    """Abstract base for decryption readers."""
 
     def __init__(
         self,
         source: IO[bytes],
-        cipher_mode: CipherMode,
-        *,
-        root_key_context: SecureTarRootKeyContext,
-        derived_key_id: Hashable | None = None,
+        key_material: SecureTarDerivedKeyMaterial,
+        ciphertext_size: int | None = None,
+        plaintext_size: int | None = None,
     ) -> None:
-        super().__init__(
-            cipher_mode,
-            root_key_context=root_key_context,
-            derived_key_id=derived_key_id,
-        )
-        self._source = source
+        """Initialize decryption reader."""
+        super().__init__(source, ciphertext_size)
+        self._plaintext_size = plaintext_size
 
-    def open(self, plaintext_size: int | None = None) -> None:
-        """Initialize cipher."""
-        if self._cipher_mode == CipherMode.DECRYPT:
-            self._open_for_decrypt(self._source)
-        else:
-            if plaintext_size is None:
-                raise ValueError("plaintext_size required for encryption")
-            self._open_for_encrypt(plaintext_size)
-
-    def read(self, size: int = 0) -> bytes:
-        """Read from source and transform (encrypt or decrypt)."""
-        if not self._cipher or not self._padder:
-            raise SecureTarError("Cipher not initialized")
-        data = self._padder.update(self._source.read(size))
-        return self._cipher.update(data)
+    @property
+    def plaintext_size(self) -> int | None:
+        """Return the total plaintext bytes written."""
+        return self._plaintext_size
 
 
-class _CipherWriter(_CipherIO):
-    """Encrypts data and writes to a stream."""
+class EncryptWriter(CipherStream):
+    """Abstract base for encryption writers."""
 
     def __init__(
         self,
         dest: IO[bytes],
-        *,
-        root_key_context: SecureTarRootKeyContext,
-        derived_key_id: Hashable | None = None,
+        key_material: SecureTarDerivedKeyMaterial,
     ) -> None:
-        super().__init__(
-            CipherMode.ENCRYPT,
-            root_key_context=root_key_context,
-            derived_key_id=derived_key_id,
-        )
+        """Initialize encryption writer."""
         self._dest = dest
-
-    def open(self) -> None:
-        """Initialize cipher and write header."""
-        self._open_for_encrypt(0)  # Size unknown at this point
-        self._dest.write(self.securetar_header.to_bytes())
+        self._plaintext_size = 0
 
     def write(self, data: bytes) -> None:
-        """Encrypt and write to destination."""
-        if not self._cipher or not self._padder:
-            raise SecureTarError("Cipher not initialized")
-        data = self._padder.update(data)
-        self._dest.write(self._cipher.update(data))
+        """Write plaintext data to be encrypted."""
+        self._plaintext_size += len(data)
+        self._write(data)
 
-    def finalize_header(self, ciphertext_size: int) -> None:
-        """Update header with plaintext size based on final ciphertext size."""
-        # The size of the plaintext is the size of the ciphertext size minus:
-        # - The size of the SecureTar header if present (secure tar version 2+)
-        # - The size of the IV
-        # - The size of the padding added (1..16 bytes)
-        if self.securetar_header and self.padding_length:
-            self.securetar_header.plaintext_size = (
-                ciphertext_size - self.padding_length - IV_SIZE - SECURETAR_HEADER_SIZE
-            )
+    @abstractmethod
+    def _write(self, data: bytes) -> None:
+        """Write plaintext data to be encrypted."""
 
-    def close(self) -> None:
-        """Finalize and write padding."""
-        if self._padder:
-            padding_bytes = self.finalize_padding()
-            self._dest.write(padding_bytes)
-        super().close()
+    @property
+    def plaintext_size(self) -> int:
+        """Return the total plaintext bytes written."""
+        return self._plaintext_size
 
 
-class _FramedReader:
-    """Base class to decrypt or encrypt a stream with framing."""
+class EncryptReader(CipherReader):
+    """Abstract base for encryption readers (for streaming encryption)."""
+
+    _ciphertext_size: int
 
     def __init__(
         self,
-        source: _CipherReader,
-        size: int,
-        header: bytes | None = None,
+        source: IO[bytes],
+        key_material: SecureTarDerivedKeyMaterial,
+        plaintext_size: int,
+    ) -> None:
+        """Initialize encryption reader."""
+        super().__init__(source, 0)
+        self._plaintext_size = plaintext_size
+
+    @property
+    def ciphertext_size(self) -> int:
+        """Return the total ciphertext size."""
+        return self._ciphertext_size
+
+
+class CipherStreamFactory(ABC):
+    """Abstract factory for creating cipher streams."""
+
+    create_decrypt_reader: type[DecryptReader]
+    """Create a decryption reader."""
+
+    create_encrypt_writer: type[EncryptWriter]
+    """Create an encryption writer."""
+
+    create_encrypt_reader: type[EncryptReader]
+    """Create an encryption reader (for streaming encryption with known size)."""
+
+
+class _AesCbcDecryptReader(DecryptReader):
+    """AES-CBC decryption reader.
+
+    AES-CBC is used in SecureTar v1 and v2.
+    """
+
+    def __init__(
+        self,
+        source: IO[bytes],
+        key_material: SecureTarDerivedKeyMaterial,
+        ciphertext_size: int | None = None,
+        plaintext_size: int | None = None,
     ) -> None:
         """Initialize."""
-        self._head = header
-        self._source = source
+        super().__init__(source, key_material, ciphertext_size, plaintext_size)
         self._pos = 0
-        self._size = size
-        self._tail: bytes | None = None
+        self._validated = False
 
-    def read(self, size: int = 0) -> bytes:
-        """Read data."""
-        if self._tail is not None:
-            # Finish reading tail
-            data = self._tail[:size]
-            self._tail = self._tail[size:]
-            return data
+        aes = Cipher(
+            algorithms.AES(key_material.key),
+            modes.CBC(key_material.iv),
+            backend=default_backend(),
+        )
+        self._cipher = aes.decryptor()
 
-        if self._head:
-            # Read from head
-            data = self._head[:size]
-            self._head = self._head[size:]
-            remaining = size - len(data)
-            if remaining:
-                data += self._source.read(remaining)
-        else:
-            data = self._source.read(size)
+    def _validate(self) -> None:
+        """Validate decrypted data looks like tar/gzip."""
+        if self._validated:
+            return
 
-        self._pos += len(data)
-        if not data or self._size - self._pos > BLOCK_SIZE:
-            return data
+        # Read first block to validate
+        encrypted = self._source.read(TAR_BLOCK_SIZE)
+        self._pos = len(encrypted)
+        self._buffer = self._cipher.update(encrypted)
 
-        # Last block: Append any remaining head, read tail and handle padding
-        if self._head:
-            data += self._head
-        data += self._source.read(max(self._size - self._pos, 0))
-        data = self._process_padding(data)
-        self._tail = data[size:]
-        return data[:size]
+        if not _is_valid_tar_header(self._buffer):
+            raise SecureTarReadError("The inner tar is not gzip or tar, wrong key?")
 
-    def _process_padding(self, data: bytes) -> bytes:
-        """Process padding."""
-        raise NotImplementedError
+        self._validated = True
+
+    def _fill_buffer(self, size: int) -> None:
+        """Fill buffer with decrypted data."""
+        if not self._validated:
+            self._validate()
+
+        # Determine how much more to read
+        to_read = max(size, DEFAULT_BUFSIZE)
+        if self._ciphertext_size is not None:
+            # Bounded: read up to remaining ciphertext
+            remaining = self._ciphertext_size - self._pos
+            to_read = min(to_read, remaining)
+
+        while len(self._buffer) < size + AES_BLOCK_SIZE and not self._done:
+            encrypted_data = self._source.read(to_read)
+            if not encrypted_data:
+                # EOF - strip padding
+                self._strip_padding()
+                self._done = True
+                break
+
+            self._pos += len(encrypted_data)
+            self._buffer += self._cipher.update(encrypted_data)
+
+            # Check if we've read all ciphertext (bounded case)
+            if self._ciphertext_size is not None and self._pos >= self._ciphertext_size:
+                self._strip_padding()
+                self._done = True
+                break
+
+    def _strip_padding(self) -> None:
+        """Strip PKCS7 padding from buffer."""
+        if self._buffer:
+            padding_len = self._buffer[-1]
+            self._buffer = self._buffer[:-padding_len]
+
+    def close(self) -> None:
+        """Close the decrypt reader."""
+        self._cipher = None
 
 
-class _FramedDecryptingReader(_FramedReader):
-    """Decrypt a stream with framing."""
+class _AesCbcEncryptWriter(EncryptWriter):
+    """AES-CBC encryption writer.
 
-    def read(self, size: int = 0) -> bytes:
-        """Read data."""
-        if self._head is None:
-            # Read and validate header
-            self._head = self._source.read(max(size, TAR_BLOCK_SIZE))
-            if not _is_valid_tar_header(self._head):
-                raise SecureTarReadError("The inner tar is not gzip or tar, wrong key?")
+    AES-CBC is used in SecureTar v1 and v2.
+    """
 
-        return super().read(size)
+    def __init__(
+        self,
+        dest: IO[bytes],
+        key_material: SecureTarDerivedKeyMaterial,
+    ) -> None:
+        """Initialize."""
+        super().__init__(dest, key_material)
 
-    def _process_padding(self, data: bytes) -> bytes:
-        """Process padding."""
-        padding_len = data[-1]
-        return data[:-padding_len]
+        aes = Cipher(
+            algorithms.AES(key_material.key),
+            modes.CBC(key_material.iv),
+            backend=default_backend(),
+        )
+        self._cipher = aes.encryptor()
+        self._padder = padding.PKCS7(AES_BLOCK_SIZE_BITS).padder()
+
+    def _write(self, data: bytes) -> None:
+        """Write plaintext data to be encrypted."""
+        padded = self._padder.update(data)
+        if padded:
+            self._dest.write(self._cipher.update(padded))
+
+    def close(self) -> None:
+        """Close the encrypt writer."""
+        if self._padder and self._cipher:
+            final_padding = self._padder.finalize()
+            self._dest.write(self._cipher.update(final_padding))
+        self._padder = None
+        self._cipher = None
+
+
+class _AesCbcEncryptReader(EncryptReader):
+    """AES-CBC encryption reader (for streaming encryption).
+
+    AES-CBC is used in SecureTar v1 and v2.
+    """
+
+    def __init__(
+        self,
+        source: IO[bytes],
+        key_material: SecureTarDerivedKeyMaterial,
+        plaintext_size: int,
+    ) -> None:
+        """Initialize."""
+        super().__init__(source, key_material, plaintext_size)
+        self._ciphertext_size = (
+            plaintext_size + AES_BLOCK_SIZE - (plaintext_size % AES_BLOCK_SIZE)
+        )
+        self._pos = 0
+
+        self._cipher = Cipher(
+            algorithms.AES(key_material.key),
+            modes.CBC(key_material.iv),
+            backend=default_backend(),
+        ).encryptor()
+        self._padder = padding.PKCS7(AES_BLOCK_SIZE_BITS).padder()
+
+    def _fill_buffer(self, size: int) -> None:
+        """Fill buffer with encrypted data."""
+        while len(self._buffer) < size and not self._done:
+            remaining = self._plaintext_size - self._pos
+            to_read = min(max(size, DEFAULT_BUFSIZE), remaining) if remaining > 0 else 0
+
+            if to_read > 0:
+                plaintext = self._source.read(to_read)
+                self._pos += len(plaintext)
+                padded = self._padder.update(plaintext)
+                if padded:
+                    self._buffer += self._cipher.update(padded)
+
+            if self._pos >= self._plaintext_size:
+                # Finalize
+                final_padding = self._padder.finalize()
+                self._buffer += self._cipher.update(final_padding)
+                self._done = True
+
+    def close(self) -> None:
+        """Close the encrypt reader."""
+        self._cipher = None
+        self._padder = None
+
+
+class AesCbcStreamFactory(CipherStreamFactory):
+    """Factory for AES-CBC streams (v1/v2)."""
+
+    create_decrypt_reader = _AesCbcDecryptReader
+    create_encrypt_writer = _AesCbcEncryptWriter
+    create_encrypt_reader = _AesCbcEncryptReader
+
+
+class _SecretStreamDecryptReader(DecryptReader):
+    """XChaCha20-Poly1305 secretstream decryption reader.
+
+    XChaCha20-Poly1305 is used in SecureTar v3.
+    """
+
+    def __init__(
+        self,
+        source: IO[bytes],
+        key_material: SecureTarDerivedKeyMaterial,
+        ciphertext_size: int | None = None,
+        plaintext_size: int | None = None,
+    ) -> None:
+        """Initialize."""
+        if plaintext_size is None:
+            raise ValueError("Plaintext size is required")
+
+        # Calculate number of chunks using integer ceiling division to avoid
+        # rounding issues, and ensure at least 1 chunk for empty plaintext
+        num_chunks = (
+            plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
+        ) // V3_SECRETSTREAM_CHUNK_SIZE
+        if num_chunks == 0:
+            num_chunks = 1
+        # Calculate ciphertext size based on plaintext size which is always
+        # known for v3
+        ciphertext_size = plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES
+
+        super().__init__(source, key_material, ciphertext_size, plaintext_size)
+        self._pos = 0
+
+        # Initialize from header stored in cipher_initialization
+        self._state = nss.crypto_secretstream_xchacha20poly1305_state()
+        # For v3, iv contains the secretstream header
+        nss.crypto_secretstream_xchacha20poly1305_init_pull(
+            self._state, key_material.iv, key_material.key
+        )
+
+    def _fill_buffer(self, size: int) -> None:
+        """Fill buffer with decrypted data."""
+        while len(self._buffer) < size and not self._done:
+            chunk_size = V3_SECRETSTREAM_CHUNK_SIZE + V3_SECRETSTREAM_ABYTES
+
+            # Check bounds
+            remaining = self._ciphertext_size - self._pos
+            chunk_size = min(chunk_size, max(remaining, 0))
+
+            encrypted = self._source.read(chunk_size)
+
+            self._pos += len(encrypted)
+            plaintext, tag = nss.crypto_secretstream_xchacha20poly1305_pull(
+                self._state, encrypted
+            )
+            self._buffer += plaintext
+
+            remaining = self._ciphertext_size - self._pos
+            if tag == NSS_TAG_FINAL and remaining != 0:
+                raise SecureTarReadError(
+                    "Unexpected final tag in secretstream decryption"
+                )
+            if remaining == 0 and tag != NSS_TAG_FINAL:
+                raise SecureTarReadError("Missing final tag in secretstream decryption")
+
+            if tag == NSS_TAG_FINAL:
+                self._done = True
+
+    def close(self) -> None:
+        """Close the decrypt reader."""
+        self._state = None
+
+
+class _SecretStreamEncryptWriter(EncryptWriter):
+    """XChaCha20-Poly1305 secretstream encryption writer.
+
+    XChaCha20-Poly1305 is used in SecureTar v3.
+    """
+
+    def __init__(
+        self,
+        dest: IO[bytes],
+        key_material: SecureTarDerivedKeyMaterial,
+    ) -> None:
+        """Initialize."""
+        super().__init__(dest, key_material)
+        self._buffer = b""
+
+        self._state = nss.crypto_secretstream_xchacha20poly1305_state()
+        # We use pull init here since the header is already prepared
+        nss.crypto_secretstream_xchacha20poly1305_init_pull(
+            self._state, key_material.iv, key_material.key
+        )
+
+    def _write(self, data: bytes) -> None:
+        """Write plaintext data to be encrypted."""
+        self._buffer += data
+
+        while len(self._buffer) > V3_SECRETSTREAM_CHUNK_SIZE:
+            chunk = self._buffer[:V3_SECRETSTREAM_CHUNK_SIZE]
+            self._buffer = self._buffer[V3_SECRETSTREAM_CHUNK_SIZE:]
+            encrypted = nss.crypto_secretstream_xchacha20poly1305_push(
+                self._state, chunk, None, NSS_TAG_MESSAGE
+            )
+            self._dest.write(encrypted)
+
+    def close(self) -> None:
+        """Close the encrypt writer."""
+        if self._state and self._buffer is not None:
+            # Write final chunk
+            encrypted = nss.crypto_secretstream_xchacha20poly1305_push(
+                self._state, self._buffer, None, NSS_TAG_FINAL
+            )
+            self._dest.write(encrypted)
+            self._buffer = None
+        self._state = None
+
+
+class _SecretStreamEncryptReader(EncryptReader):
+    """XChaCha20-Poly1305 secretstream encryption reader.
+
+    XChaCha20-Poly1305 is used in SecureTar v3.
+    """
+
+    def __init__(
+        self,
+        source: IO[bytes],
+        key_material: SecureTarDerivedKeyMaterial,
+        plaintext_size: int,
+    ) -> None:
+        """Initialize."""
+        super().__init__(source, key_material, plaintext_size)
+        # Calculate number of chunks using integer ceiling division to avoid
+        # rounding issues, and ensure at least 1 chunk for empty plaintext
+        num_chunks = (
+            plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
+        ) // V3_SECRETSTREAM_CHUNK_SIZE
+        if num_chunks == 0:
+            num_chunks = 1
+        # Calculate ciphertext size
+        self._ciphertext_size = plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES
+
+        self._pos = 0
+
+        self._state = nss.crypto_secretstream_xchacha20poly1305_state()
+        # We use pull init here since the header is already prepared
+        nss.crypto_secretstream_xchacha20poly1305_init_pull(
+            self._state, key_material.iv, key_material.key
+        )
+
+    def _fill_buffer(self, size: int) -> None:
+        """Fill buffer with encrypted data."""
+        while len(self._buffer) < size and not self._done:
+            remaining = self._plaintext_size - self._pos
+            to_read = min(V3_SECRETSTREAM_CHUNK_SIZE, remaining)
+
+            plaintext = self._source.read(to_read)
+            self._pos += len(plaintext)
+
+            is_final = self._pos >= self._plaintext_size
+            tag = NSS_TAG_FINAL if is_final else NSS_TAG_MESSAGE
+
+            encrypted = nss.crypto_secretstream_xchacha20poly1305_push(
+                self._state, plaintext, None, tag
+            )
+            self._buffer += encrypted
+
+            if is_final:
+                self._done = True
+
+    def close(self) -> None:
+        """Close the encrypt reader."""
+        self._state = None
+
+
+class SecretStreamFactory(CipherStreamFactory):
+    """Factory for XChaCha20-Poly1305 secretstream (v3)."""
+
+    create_decrypt_reader = _SecretStreamDecryptReader
+    create_encrypt_writer = _SecretStreamEncryptWriter
+    create_encrypt_reader = _SecretStreamEncryptReader
 
 
 class SecureTarDecryptStream:
     """Decrypts an encrypted tar read from a stream."""
 
-    _cipher: _CipherReader
-
     def __init__(
         self,
         source: IO[bytes],
         *,
-        ciphertext_size: int,
+        ciphertext_size: int | None = None,
         root_key_context: SecureTarRootKeyContext,
     ) -> None:
+        """Initialize."""
         self._source = source
         self._root_key_context = root_key_context
         self._ciphertext_size = ciphertext_size
+        self._stream: DecryptReader | None = None
+        self._header: SecureTarHeader | None = None
 
-    def __enter__(self) -> _FramedDecryptingReader:
-        """Returns a readable stream of decrypted bytes."""
-        self._cipher = _CipherReader(
+    def __enter__(self) -> DecryptReader:
+        self._header = SecureTarHeader.from_bytes(self._source)
+        key_material = self._root_key_context.restore_key_material(self._header)
+
+        ciphertext_size = None
+        if self._ciphertext_size is not None:
+            ciphertext_size = self._ciphertext_size - self._header.size
+        self._stream = self._root_key_context.stream_factory.create_decrypt_reader(
             self._source,
-            CipherMode.DECRYPT,
-            root_key_context=self._root_key_context,
+            key_material,
+            ciphertext_size,
+            self._header.plaintext_size,
         )
-        self._cipher.open()
-
-        # The size of the plaintext is the ciphertext size minus:
-        # - The size of the SecureTar header if present (secure tar version 2+)
-        # - The size of the IV
-        # - Padding (discarded by _FramedDecryptingReader, not known for version 1)
-        plaintext_size_with_padding = self._ciphertext_size - IV_SIZE
-        if self._cipher.securetar_header.plaintext_size is not None:
-            plaintext_size_with_padding -= SECURETAR_HEADER_SIZE
-
-        return _FramedDecryptingReader(self._cipher, plaintext_size_with_padding)
+        return self._stream
 
     def __exit__(self, exc_type, exc_value, tb) -> None:
-        self._cipher.close()
+        if self._stream:
+            self._stream.close()
+            self._stream = None
 
-    def validate(self) -> bool:
-        """Validate the password by checking if decrypted data looks like a tar.
+    def validate(self, *, basic_validation: bool) -> bool:
+        """Validate the stream.
+
+        This will fail if the password is invalid or data is corrupted.
+        If the securetar version is 3, it will also validate that the stream
+        is not truncated.
+
+        If basic_validation is True, only the beginning of the stream is validated
+        to check if it looks like a tar/gzip.
 
         Note: This consumes the stream. Create a new instance to read data.
 
         Returns:
             True if password is valid, False otherwise.
         """
-        with self as reader:
-            try:
-                reader.read(1)
-                return True
-            except SecureTarReadError:
-                return False
+        chunk_size = 1 if basic_validation else 1024 * 1024
+        try:
+            with self as stream:
+                while stream.read(chunk_size):
+                    if basic_validation:
+                        return True
+                    pass
+        except (InvalidPasswordError, SecureTarReadError, CryptoError):
+            return False
+        return True
 
 
-class _FramedEncryptingReader(_FramedReader):
-    """Encrypt a stream with framing."""
+class _FramedEncryptReader:
+    """Wraps an encrypt reader with a SecureTar header."""
 
-    def __init__(
-        self,
-        source: _CipherReader,
-        size: int,
-        *,
-        header: bytes,
-    ) -> None:
+    def __init__(self, inner: EncryptReader, header: SecureTarHeader) -> None:
         """Initialize."""
-        self.encrypted_size = size
-        super().__init__(source, size, header=header)
+        self._inner = inner
+        self._header = header
+        self._header_bytes: bytes | None = header.to_bytes()
+        self._ciphertext_size = header.size + inner.ciphertext_size
 
-    def _process_padding(self, data: bytes) -> bytes:
-        """Process padding."""
-        return data + self._source.finalize_padding()
+    @property
+    def ciphertext_size(self) -> int:
+        """Return the size of the ciphertext data."""
+        return self._ciphertext_size
+
+    def read(self, size: int = 0) -> bytes:
+        """Read data from buffer, filling as needed.
+
+        Will first return header bytes, then data from inner stream.
+        """
+        data = b""
+
+        if self._header_bytes:
+            data = self._header_bytes[:size]
+            self._header_bytes = (
+                self._header_bytes[size:] if len(self._header_bytes) > size else None
+            )
+            size -= len(data)
+            if size == 0:
+                return data
+
+        data += self._inner.read(size)
+        return data
+
+    def close(self) -> None:
+        """Close the stream."""
+        self._inner.close()
 
 
 class SecureTarEncryptStream:
     """Encrypt a plaintext tar read from a stream."""
 
-    _cipher: _CipherReader
-
     def __init__(
         self,
         source: IO[bytes],
         *,
+        create_version: int,
         derived_key_id: Hashable | None,
         plaintext_size: int,
         root_key_context: SecureTarRootKeyContext,
     ) -> None:
+        """Initialize."""
         self._source = source
+        self._create_version = create_version
         self._derived_key_id = derived_key_id
         self._plaintext_size = plaintext_size
         self._root_key_context = root_key_context
+        self._stream: _FramedEncryptReader | None = None
 
-    def __enter__(self) -> _FramedEncryptingReader:
-        """Returns a readable stream of encrypted bytes."""
-        self._cipher = _CipherReader(
+    def __enter__(self) -> _FramedEncryptReader:
+        key_material = self._root_key_context.derive_key_material(
+            self._derived_key_id, self._create_version
+        )
+
+        factory = self._root_key_context.stream_factory
+        inner_stream = factory.create_encrypt_reader(
             self._source,
-            CipherMode.ENCRYPT,
-            root_key_context=self._root_key_context,
-            derived_key_id=self._derived_key_id,
-        )
-        self._cipher.open(plaintext_size=self._plaintext_size)
-
-        # The ciphertext size is the sum of:
-        # - The size of the SecureTar header
-        # - The size of the IV
-        # - The size of the plaintext, padded to the next cipher block boundary
-        ciphertext_size = (
-            SECURETAR_HEADER_SIZE
-            + IV_SIZE
-            + self._plaintext_size
-            + BLOCK_SIZE
-            - self._plaintext_size % BLOCK_SIZE
+            key_material,
+            self._plaintext_size,
         )
 
-        return _FramedEncryptingReader(
-            self._cipher,
-            ciphertext_size,
-            header=self._cipher.securetar_header.to_bytes(),
+        header = SecureTarHeader(
+            key_material.cipher_initialization,
+            self._plaintext_size,
+            self._create_version,
         )
+
+        self._stream = _FramedEncryptReader(inner_stream, header)
+        return self._stream
 
     def __exit__(self, exc_type, exc_value, tb) -> None:
-        self._cipher.close()
+        if self._stream:
+            self._stream.close()
+            self._stream = None
 
 
 class SecureTarFile:
     """Handle tar files, optionally wrapped in an encryption layer."""
 
+    supported_modes = (MOD_READ,)
+
     def __init__(
         self,
         name: Path | None = None,
-        mode: Literal["r", "w", "x"] = "r",
+        mode: Literal["r"] = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
+        create_version: int | None = None,
         derived_key_id: Hashable | None = None,
         fileobj: IO[bytes] | None = None,
         gzip: bool = True,
@@ -485,6 +877,7 @@ class SecureTarFile:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
             bufsize: Buffer size for I/O operations
+            create_version: SecureTar version to create (2 or 3). If None, defaults to 3
             derived_key_id: Optional derived key ID for deriving key material. Mutually
             exclusive with password.
             fileobj: File object to use instead of opening a file
@@ -494,6 +887,13 @@ class SecureTarFile:
             root_key_context: Root key context to use for deriving key material. Mutually
             exclusive with password.
         """
+        if mode == MOD_READ:
+            if create_version is not None:
+                raise ValueError("Version must be None when reading a SecureTar file")
+        elif create_version is None:
+            create_version = DEFAULT_CIPHER_VERSION
+        elif create_version not in (2, 3):
+            raise ValueError(f"Unsupported SecureTar version: {create_version}")
 
         if derived_key_id is not None and root_key_context is None:
             raise ValueError(
@@ -505,10 +905,8 @@ class SecureTarFile:
         if name is None and fileobj is None:
             raise ValueError("Either filename or fileobj must be provided")
 
-        if mode not in (MOD_EXCLUSIVE, MOD_READ, MOD_WRITE):
-            raise ValueError(
-                f"Mode must be '{MOD_EXCLUSIVE}', '{MOD_READ}', or '{MOD_WRITE}'"
-            )
+        if mode not in self.supported_modes:
+            raise ValueError(f"Mode must be '{', '.join(self.supported_modes)}'")
 
         self._file: IO[bytes] | None = None
         self._mode: str = mode
@@ -516,9 +914,11 @@ class SecureTarFile:
         self._bufsize: int = bufsize
         self._extra_tar_args: dict[str, Any] = {}
         self._fileobj = fileobj
+        self._create_version = create_version
         self._tar: tarfile.TarFile | None = None
         self._derived_key_id = derived_key_id
-        self._cipher: _CipherReader | _CipherWriter | None = None
+        self._cipher_stream: CipherStream | None = None
+        self._header: SecureTarHeader | None = None
 
         # Determine if encrypted
         self._encrypted = password is not None or root_key_context is not None
@@ -572,24 +972,33 @@ class SecureTarFile:
 
         # Set up cipher layer
         if self._mode == MOD_READ:
-            self._cipher = _CipherReader(
-                self._file,
-                CipherMode.DECRYPT,
-                root_key_context=self._root_key_context,
-                derived_key_id=None,
+            self._header = SecureTarHeader.from_bytes(self._file)
+            key_material = self._root_key_context.restore_key_material(self._header)
+            factory = self._root_key_context.stream_factory
+            self._cipher_stream = factory.create_decrypt_reader(
+                self._file, key_material, plaintext_size=self._header.plaintext_size
             )
-            self._cipher.open()
         else:
-            self._cipher = _CipherWriter(
-                self._file,
-                root_key_context=self._root_key_context,
-                derived_key_id=self._derived_key_id,
+            # _create_version set in constructor if encrypted
+            if TYPE_CHECKING:
+                assert self._create_version is not None
+            key_material = self._root_key_context.derive_key_material(
+                self._derived_key_id, self._create_version
             )
-            self._cipher.open()
+            self._header = SecureTarHeader(
+                key_material.cipher_initialization,
+                0,
+                self._create_version,
+            )
+            self._file.write(self._header.to_bytes())
+            factory = self._root_key_context.stream_factory
+            self._cipher_stream = factory.create_encrypt_writer(
+                self._file, key_material
+            )
 
         # Open tar with cipher as fileobj
         self._tar = tarfile.open(
-            fileobj=self._cipher,
+            fileobj=self._cipher_stream,
             mode=self._tar_mode,
             dereference=False,
             bufsize=self._bufsize,
@@ -621,25 +1030,19 @@ class SecureTarFile:
         if self._tar:
             self._tar.close()
             self._tar = None
-        if self._cipher:
-            self._cipher.close()
-            self._cipher = None
+        if self._cipher_stream:
+            self._cipher_stream.close()
+            self._cipher_stream = None
         if self._file:
             if not self._fileobj:
                 self._file.close()
             self._file = None
 
-    def validate_password(self) -> bool:
-        """Validate the password by checking if decrypted data looks like a tar.
+    def _validate(self, *, basic_validation: bool) -> bool:
+        """Validate the data.
 
-        Note: If using fileobj instead of a file path, this consumes the stream
-        and a new SecureTarFile instance must be created to read data.
-
-        Returns:
-            True if password is valid, False otherwise.
-
-        Raises:
-            SecureTarError: If file is not encrypted, not in read mode, or already open.
+        If basic_validation is True, only the beginning of the stream is validated
+        to check if it looks like a tar/gzip.
         """
         if not self._encrypted:
             raise SecureTarError("File is not encrypted")
@@ -655,20 +1058,41 @@ class SecureTarFile:
 
         file = self._open_file()
         try:
-            cipher = _CipherReader(
+            return SecureTarDecryptStream(
                 file,
-                CipherMode.DECRYPT,
                 root_key_context=self._root_key_context,
-            )
-            cipher.open()
-
-            data = cipher.read(TAR_BLOCK_SIZE)
-            cipher.close()
-
-            return _is_valid_tar_header(data)
+            ).validate(basic_validation=basic_validation)
         finally:
             if not self._fileobj:
                 file.close()
+
+    def validate_password(self) -> bool:
+        """Validate the password by checking if decrypted data looks like a tar.
+
+        Note: If using fileobj instead of a file path, this consumes the stream
+        and a new SecureTarFile instance must be created to read data.
+
+        Returns:
+            True if password is valid, False otherwise.
+
+        Raises:
+            SecureTarError: If file is not encrypted, not in read mode, or already open.
+        """
+        return self._validate(basic_validation=True)
+
+    def validate(self) -> bool:
+        """Validate the data.
+
+        Note: If using fileobj instead of a file path, this consumes the stream
+        and a new SecureTarFile instance must be created to read data.
+
+        Returns:
+            True if password is valid, False otherwise.
+
+        Raises:
+            SecureTarError: If file is not encrypted, not in read mode, or already open.
+        """
+        return self._validate(basic_validation=False)
 
     @property
     def path(self) -> Path:
@@ -688,16 +1112,18 @@ class InnerSecureTarFile(SecureTarFile):
 
     _header_length: int
     _header_position: int
+    supported_modes = (MOD_WRITE,)
     _tar_info: tarfile.TarInfo
 
     def __init__(
         self,
         outer_tar: tarfile.TarFile,
         name: Path,
-        mode: Literal["r", "w", "x"],
+        mode: Literal["w"],
         *,
         bufsize: int,
         derived_key_id: Hashable | None,
+        create_version: int | None,
         gzip: bool,
         root_key_context: SecureTarRootKeyContext | None,
     ) -> None:
@@ -709,6 +1135,7 @@ class InnerSecureTarFile(SecureTarFile):
             bufsize=bufsize,
             derived_key_id=derived_key_id,
             fileobj=outer_tar.fileobj,
+            create_version=create_version,
             root_key_context=root_key_context,
         )
         self.outer_tar = outer_tar
@@ -745,11 +1172,16 @@ class InnerSecureTarFile(SecureTarFile):
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         """Close file."""
-        cipher = self._cipher
+        # This class is only used for writing inner tar files, so we know
+        # that if _cipher_stream is set, it is an EncryptWriter.
+        if TYPE_CHECKING:
+            assert isinstance(self._cipher_stream, (EncryptWriter, NoneType))
+        # Capture encrypt_writer before super().__exit__ sets it to None
+        encrypt_writer: EncryptWriter | None = self._cipher_stream  # type: ignore[assignment]
         super().__exit__(exc_type, exc_value, traceback)
-        self._finalize_tar_entry(cipher)
+        self._finalize_tar_entry(encrypt_writer)
 
-    def _finalize_tar_entry(self, cipher: _CipherWriter | None) -> None:
+    def _finalize_tar_entry(self, encrypt_writer: EncryptWriter | None) -> None:
         """Update tar header and securetar header with final sizes."""
         outer_tar = self.outer_tar
         fileobj = self.outer_tar.fileobj
@@ -767,10 +1199,10 @@ class InnerSecureTarFile(SecureTarFile):
         outer_tar.offset += size_of_inner_tar + padding_size
 
         # Update securetar header with plaintext size if encrypted
-        if self._encrypted and cipher and cipher.padding_length:
-            cipher.finalize_header(size_of_inner_tar)
+        if self._encrypted and self._header and encrypt_writer:
+            self._header.plaintext_size = encrypt_writer.plaintext_size
             fileobj.seek(self._header_position + self._header_length)
-            fileobj.write(cipher.securetar_header.to_bytes())
+            fileobj.write(self._header.to_bytes())
 
         # Now that we know the size of the inner tar, we seek back
         # to where we started and re-write the header with the correct size
@@ -800,6 +1232,7 @@ class SecureTarArchive:
         mode: Literal["r", "w"] = "r",
         *,
         bufsize: int = DEFAULT_BUFSIZE,
+        create_version: int | None = None,
         fileobj: IO[bytes] | None = None,
         password: str | None = None,
         root_key_context: SecureTarRootKeyContext | None = None,
@@ -811,6 +1244,7 @@ class SecureTarArchive:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
             bufsize: Buffer size for I/O operations
+            create_version: SecureTar version to create (2 or 3). If None, defaults to 3
             fileobj: File object to use instead of opening a file
             password: Password for encryption/decryption of inner tar files. Mutually
             exclusive with root_key_context.
@@ -818,6 +1252,13 @@ class SecureTarArchive:
             exclusive with password.
             streaming: Whether to use streaming mode for tarfile (no seeking)
         """
+        if mode == MOD_READ:
+            if create_version is not None:
+                raise ValueError("Version must be None when reading a SecureTar file")
+        elif create_version is None:
+            create_version = DEFAULT_CIPHER_VERSION
+        elif create_version not in (2, 3):
+            raise ValueError(f"Unsupported SecureTar version: {create_version}")
         if root_key_context is not None and password is not None:
             raise ValueError("Cannot specify both 'root_key_context' and 'password'")
         if name is None and fileobj is None:
@@ -828,6 +1269,7 @@ class SecureTarArchive:
                 f"Mode must be '{MOD_EXCLUSIVE}', '{MOD_READ}', or '{MOD_WRITE}'"
             )
 
+        self._create_version = create_version
         self._name = name
         self._mode = mode
         self._bufsize = bufsize
@@ -906,6 +1348,7 @@ class SecureTarArchive:
             gzip=gzip,
             mode="w",
             name=Path(name),
+            create_version=self._create_version,
             derived_key_id=derived_key_id,
             root_key_context=self._root_key_context,
         )
@@ -967,22 +1410,17 @@ class SecureTarArchive:
 
         with SecureTarEncryptStream(
             source,
+            create_version=self._create_version,
             derived_key_id=derived_key_id,
             plaintext_size=member.size,
             root_key_context=self._root_key_context,
         ) as encrypted:
             encrypted_tar_info = copy.deepcopy(member)
-            encrypted_tar_info.size = encrypted.encrypted_size
+            encrypted_tar_info.size = encrypted.ciphertext_size
             self._tar.addfile(encrypted_tar_info, encrypted)
 
-    def validate_password(self, member: tarfile.TarInfo) -> bool:
-        """Validate the password against an encrypted inner tar.
-
-        Note: This consumes the stream. Create a new instance to read data.
-
-        Args:
-            member: TarInfo of an encrypted tar file to validate against
-        """
+    def _validate(self, member: tarfile.TarInfo, *, basic_validation: bool) -> bool:
+        """Validate an encrypted inner tar."""
         if not self._tar:
             raise SecureTarError("Archive not open")
 
@@ -992,74 +1430,303 @@ class SecureTarArchive:
         if not self._root_key_context:
             raise SecureTarError("No password provided")
 
-        return self.extract_tar(member).validate()
+        return self.extract_tar(member).validate(basic_validation=basic_validation)
+
+    def validate_password(self, member: tarfile.TarInfo) -> bool:
+        """Validate the password against an encrypted inner tar.
+
+        Note: This consumes the stream. Create a new instance to read data.
+
+        Args:
+            member: TarInfo of an encrypted tar file to validate against
+        """
+        return self._validate(member, basic_validation=True)
+
+    def validate(self, member: tarfile.TarInfo) -> bool:
+        """Validate an encrypted inner tar.
+
+        Note: This consumes the stream. Create a new instance to read data.
+
+        Args:
+            member: TarInfo of an encrypted tar file to validate against
+        """
+        return self._validate(member, basic_validation=False)
 
 
-@dataclass(frozen=True, kw_only=True)
-class SecureTarDerivedKeyMaterial:
-    """Dataclass to hold key and iv for encrypted SecureTar file."""
+class KeyDerivationStrategy(ABC):
+    """Abstract base for version-specific key derivation."""
 
-    key: bytes
-    iv: bytes
-    nonce: bytes
+    stream_factory: type[CipherStreamFactory]
+    """The cipher stream factory for this version."""
+
+    @abstractmethod
+    def get_key_material(
+        self, cipher_initialization: bytes | None = None
+    ) -> SecureTarDerivedKeyMaterial:
+        """Get key material, deriving new or restoring from cipher_initialization."""
 
 
-class SecureTarRootKeyContext:
-    """Handle cipher contexts for multiple inner SecureTar files."""
+class KeyDerivationV2(KeyDerivationStrategy):
+    """Key derivation for SecureTar v1 and v2."""
 
-    _key: bytes | None = None
+    stream_factory = AesCbcStreamFactory
 
-    def __init__(self, password: str):
+    def __init__(self, password: str) -> None:
         """Initialize."""
-        self._password = password
-        self._derived_keys: dict[Hashable, SecureTarDerivedKeyMaterial] = {}
-
-    def derive_key_material(
-        self, key_id: Hashable | None = None
-    ) -> SecureTarDerivedKeyMaterial:
-        """Derive per-entry key material from the root key."""
-        if not self._key:
-            self._key = self._password_to_key(self._password)
-        if key_id is None:
-            return self._derive_key_material()
-        if key_id not in self._derived_keys:
-            self._derived_keys[key_id] = self._derive_key_material()
-        return self._derived_keys[key_id]
-
-    def _derive_key_material(self) -> SecureTarDerivedKeyMaterial:
-        """Derive per-entry key material from the root key."""
-        cbc_rand = os.urandom(IV_SIZE)
-        iv = self._generate_iv(self._key, cbc_rand)
-        return SecureTarDerivedKeyMaterial(key=self._key, iv=iv, nonce=cbc_rand)
-
-    def restore_key_material(
-        self, header: SecureTarHeader
-    ) -> SecureTarDerivedKeyMaterial:
-        """Reconstruct key material from existing header fields."""
-        if not self._key:
-            self._key = self._password_to_key(self._password)
-        cbc_rand = header.cbc_rand
-        iv = self._generate_iv(self._key, cbc_rand)
-        return SecureTarDerivedKeyMaterial(key=self._key, iv=iv, nonce=cbc_rand)
+        self._root_key = self._password_to_key(password)
 
     @staticmethod
     def _password_to_key(password: str) -> bytes:
-        """Generate a AES Key from password.
-
-        Uses 100 rounds of SHA256 hashing to derive a 16-byte key from a password.
-        """
+        """Generate AES key from password using 100 rounds of SHA256."""
         key: bytes = password.encode()
         for _ in range(100):
             key = hashlib.sha256(key).digest()
         return key[:16]
 
+    def get_key_material(
+        self, cipher_initialization: bytes | None = None
+    ) -> SecureTarDerivedKeyMaterialV2:
+        """Get key material, deriving new or restoring from cipher_initialization."""
+        salt = (
+            cipher_initialization
+            if cipher_initialization is not None
+            else nacl_random(AES_IV_SIZE)
+        )
+        return SecureTarDerivedKeyMaterialV2(root_key=self._root_key, salt=salt)
+
+
+class KeyDerivationV3(KeyDerivationStrategy):
+    """Key derivation for SecureTar v3."""
+
+    stream_factory = SecretStreamFactory
+
+    def __init__(
+        self,
+        root_key: bytes,
+        root_salt: bytes,
+        validation_salt: bytes,
+        validation_key: bytes,
+    ) -> None:
+        """Initialize."""
+        self._root_key = root_key
+        self._root_salt = root_salt
+        self._validation_salt = validation_salt
+        self._validation_key = validation_key
+
+    @classmethod
+    def create(cls, password: str) -> KeyDerivationV3:
+        """Create strategy for new files."""
+        root_salt = nacl_random(ARGON2_SALT_SIZE)
+        validation_salt = nacl_random(V3_DERIVED_KEY_SALT_SIZE)
+        root_key, validation_key = cls._derive_keys(
+            password, root_salt, validation_salt
+        )
+        return cls(root_key, root_salt, validation_salt, validation_key)
+
+    @classmethod
+    def from_header(cls, password: str, header: SecureTarHeader) -> KeyDerivationV3:
+        """Create strategy from existing header."""
+        root_salt, validation_salt, stored_validation_key, _, _ = struct.unpack(
+            SECURETAR_V3_CIPHER_INIT_FORMAT, header.cipher_initialization
+        )
+
+        root_key, validation_key = cls._derive_keys(
+            password, root_salt, validation_salt
+        )
+
+        # Use hmac.compare_digest to prevent timing attacks. Note that the
+        # validation key is stored in plaintext in the header, so this is
+        # primarily to avoid false positives from code analysis tools.
+        if not hmac.compare_digest(validation_key, stored_validation_key):
+            raise InvalidPasswordError("Invalid password")
+
+        return cls(root_key, root_salt, validation_salt, validation_key)
+
+    @staticmethod
+    def _derive_keys(
+        password: str, root_salt: bytes, validation_salt: bytes
+    ) -> tuple[bytes, bytes]:
+        """Derive root key and validation key from password and salts."""
+        root_key = kdf(
+            nss.crypto_secretstream_xchacha20poly1305_KEYBYTES,
+            password.encode(),
+            root_salt,
+            opslimit=V3_KDF_OPSLIMIT,
+            memlimit=V3_KDF_MEMLIMIT,
+        )
+        validation_key = blake2b(
+            b"",
+            key=root_key,
+            salt=validation_salt,
+            person=b"SecureTarv3",
+            encoder=nacl.encoding.RawEncoder,
+        )
+        return root_key, validation_key
+
+    def get_key_material(
+        self, cipher_initialization: bytes | None = None
+    ) -> SecureTarDerivedKeyMaterialV3:
+        """Get key material, deriving new or restoring from cipher_initialization."""
+        if cipher_initialization is not None:
+            _, _, _, derivation_salt, secretstream_header = struct.unpack(
+                SECURETAR_V3_CIPHER_INIT_FORMAT, cipher_initialization
+            )
+        else:
+            derivation_salt = nacl_random(V3_DERIVED_KEY_SALT_SIZE)
+            secretstream_header = None  # Will be generated
+
+        return SecureTarDerivedKeyMaterialV3(
+            root_key=self._root_key,
+            root_salt=self._root_salt,
+            validation_salt=self._validation_salt,
+            validation_key=self._validation_key,
+            derivation_salt=derivation_salt,
+            secretstream_header=secretstream_header,
+        )
+
+
+class SecureTarDerivedKeyMaterial(ABC):
+    """Abstract base for derived key material."""
+
+    key: bytes
+    """The derived encryption key."""
+
+    iv: bytes
+    """The initialization vector."""
+
+    @property
+    @abstractmethod
+    def cipher_initialization(self) -> bytes:
+        """Return cipher initialization bytes for the header."""
+
+
+class SecureTarDerivedKeyMaterialV2(SecureTarDerivedKeyMaterial):
+    """Key material for SecureTar v1 and v2."""
+
+    def __init__(self, root_key: bytes, salt: bytes) -> None:
+        """Initialize."""
+        self.key = root_key
+        self._salt = salt
+        self.iv = self._generate_iv(root_key, salt)
+
     @staticmethod
     def _generate_iv(key: bytes, salt: bytes) -> bytes:
-        """Generate an iv from data."""
+        """Generate an IV from key and salt."""
         temp_iv = key + salt
         for _ in range(100):
             temp_iv = hashlib.sha256(temp_iv).digest()
-        return temp_iv[:IV_SIZE]
+        return temp_iv[:AES_IV_SIZE]
+
+    @property
+    def cipher_initialization(self) -> bytes:
+        """Return cipher initialization bytes for the header."""
+        return self._salt
+
+
+class SecureTarDerivedKeyMaterialV3(SecureTarDerivedKeyMaterial):
+    """Key material for SecureTar v3."""
+
+    def __init__(
+        self,
+        root_key: bytes,
+        root_salt: bytes,
+        validation_salt: bytes,
+        validation_key: bytes,
+        derivation_salt: bytes,
+        secretstream_header: bytes | None = None,
+    ) -> None:
+        """Initialize."""
+        self._root_salt = root_salt
+        self._validation_salt = validation_salt
+        self._validation_key = validation_key
+        self._derivation_salt = derivation_salt
+
+        self.key = blake2b(
+            b"",
+            key=root_key,
+            salt=derivation_salt,
+            person=b"SecureTarv3",
+            encoder=nacl.encoding.RawEncoder,
+        )
+
+        if secretstream_header is not None:
+            self.iv = secretstream_header
+        else:
+            # Generate new header
+            self.iv = nss.crypto_secretstream_xchacha20poly1305_init_push(
+                nss.crypto_secretstream_xchacha20poly1305_state(), self.key
+            )
+
+    @property
+    def cipher_initialization(self) -> bytes:
+        """Return cipher initialization bytes for the header."""
+        return (
+            self._root_salt
+            + self._validation_salt
+            + self._validation_key
+            + self._derivation_salt
+            + self.iv
+        )
+
+
+class SecureTarRootKeyContext:
+    """Handle cipher contexts for multiple inner SecureTar files."""
+
+    def __init__(self, password: str) -> None:
+        self._password = password
+        self._strategy: KeyDerivationStrategy | None = None
+        self._version: int | None = None
+        self._derived_keys: dict[Hashable, SecureTarDerivedKeyMaterial] = {}
+
+    @property
+    def stream_factory(self) -> type[CipherStreamFactory]:
+        """Return the cipher stream factory."""
+        if self._strategy is None:
+            raise SecureTarError("Context not initialized")
+        return self._strategy.stream_factory
+
+    def _ensure_strategy(
+        self, version: int, header: SecureTarHeader | None = None
+    ) -> KeyDerivationStrategy:
+        """Ensure strategy is initialized for the given version."""
+        if self._strategy is not None:
+            if self._version != version:
+                raise SecureTarError(
+                    f"Context already initialized for version {self._version}, "
+                    f"cannot use for version {version}"
+                )
+            return self._strategy
+
+        if version in (1, 2):
+            self._strategy = KeyDerivationV2(self._password)
+        elif version == 3:
+            if header is not None:
+                self._strategy = KeyDerivationV3.from_header(self._password, header)
+            else:
+                self._strategy = KeyDerivationV3.create(self._password)
+        else:
+            raise ValueError(f"Unsupported SecureTar version: {version}")
+
+        self._version = version
+        return self._strategy
+
+    def derive_key_material(
+        self, key_id: Hashable | None, version: int
+    ) -> SecureTarDerivedKeyMaterial:
+        """Derive per-entry key material from the root key."""
+        strategy = self._ensure_strategy(version)
+        if key_id is None:
+            return strategy.get_key_material()
+        if key_id not in self._derived_keys:
+            self._derived_keys[key_id] = strategy.get_key_material()
+        return self._derived_keys[key_id]
+
+    def restore_key_material(
+        self, header: SecureTarHeader
+    ) -> SecureTarDerivedKeyMaterial:
+        """Reconstruct key material from existing header fields."""
+        strategy = self._ensure_strategy(header.version, header)
+        return strategy.get_key_material(header.cipher_initialization)
 
 
 def secure_path(tar: tarfile.TarFile) -> Generator[tarfile.TarInfo, None, None]:
