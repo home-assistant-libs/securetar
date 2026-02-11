@@ -1154,7 +1154,7 @@ class InnerSecureTarFile(SecureTarFile):
             bufsize=bufsize,
             derived_key_id=derived_key_id,
             # https://github.com/python/typeshed/issues/15365
-            fileobj=outer_tar.fileobj,  # type:ignore[arg-type]
+            fileobj=outer_tar.fileobj,  # type: ignore[arg-type]
             create_version=create_version,
             root_key_context=root_key_context,
         )
