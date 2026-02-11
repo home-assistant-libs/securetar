@@ -26,6 +26,7 @@ from securetar import (
     SecureTarArchive,
     SecureTarError,
     SecureTarFile,
+    SecureTarHeader,
     SecureTarReadError,
     SecureTarRootKeyContext,
     atomic_contents_add,
@@ -1670,3 +1671,39 @@ def test_securetarfile_size_name() -> None:
     """Test SecureTarFile.size property when name is used."""
     secure_tar_file = SecureTarFile(name=Path("test.tar"), mode="r")
     assert secure_tar_file.size == 0.01
+
+
+def test_securetarfile_v1_fallback() -> None:
+    """Test SecureTarFile with invalid magic."""
+    header_data = b"invalid magicabc"
+    header = SecureTarHeader.from_bytes(io.BytesIO(header_data))
+    assert header.version == 1
+    assert header.cipher_initialization == header_data
+
+
+@pytest.mark.parametrize(
+    ("header", "expected_exception", "expected_message"),
+    [
+        (
+            b"SecureTar\x01\x00\x00\x00\x00\x00\x00",
+            ValueError,
+            "Unsupported SecureTar version: 1",
+        ),
+        (
+            b"SecureTar\x04\x00\x00\x00\x00\x00\x00",
+            ValueError,
+            "Unsupported SecureTar version: 4",
+        ),
+        (
+            b"SecureTar\x02\x00\x00\x00\x00\x00\x01",
+            ValueError,
+            "Invalid reserved bytes in SecureTar header",
+        ),
+    ],
+)
+def test_securetarfile_invalid_magic(
+    header, expected_exception, expected_message
+) -> None:
+    """Test SecureTarFile with invalid magic."""
+    with pytest.raises(expected_exception, match=expected_message):
+        SecureTarHeader.from_bytes(io.BytesIO(header))

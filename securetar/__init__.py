@@ -157,15 +157,13 @@ class SecureTarHeader:
         header = f.read(struct.calcsize(SECURETAR_FILE_ID_FORMAT))
         plaintext_size: int | None = None
         magic, version, reserved = struct.unpack(SECURETAR_FILE_ID_FORMAT, header)
-        if (
-            magic != SECURETAR_MAGIC
-            or version not in (2, 3)
-            or reserved != SECURETAR_MAGIC_RESERVED
-        ):
-            # Assume legacy format without magic
-            cipher_initialization = header
-            version = 1
-        else:
+        if magic == SECURETAR_MAGIC:
+            # Magic matches, assume SecureTar v2+
+            if version not in (2, 3):
+                raise ValueError(f"Unsupported SecureTar version: {version}")
+            if reserved != SECURETAR_MAGIC_RESERVED:
+                raise ValueError("Invalid reserved bytes in SecureTar header")
+
             file_metadata = f.read(struct.calcsize(SECURETAR_FILE_METADATA_FORMAT))
             # Valid SecureTar v2+ header, read rest of header: plaintext size + reserved
             (plaintext_size,) = struct.unpack(
@@ -175,6 +173,10 @@ class SecureTarHeader:
                 cipher_initialization = f.read(SECURETAR_V2_CIPHER_INIT_SIZE)
             else:
                 cipher_initialization = f.read(SECURETAR_V3_CIPHER_INIT_SIZE)
+        else:
+            # Assume legacy format without magic
+            cipher_initialization = header
+            version = 1
 
         return cls(cipher_initialization, plaintext_size, version)
 
@@ -184,7 +186,7 @@ class SecureTarHeader:
             raise ValueError("Plaintext size is required")
         # Check version.
         # SecureTar versions writing v1 had bugs related to how the padding was
-        # handled, and we don't support such archives anymore.
+        # handled, and we don't support creating such archives anymore.
         if self.version not in (2, 3):
             raise ValueError(f"Unsupported SecureTar version: {self.version}")
 
