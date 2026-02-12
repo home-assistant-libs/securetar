@@ -423,7 +423,8 @@ class _AesCbcDecryptReader(DecryptReader):
 
     def close(self) -> None:
         """Close the decrypt reader."""
-        self._cipher = None
+        # Set to None to help catch any use after close bugs
+        self._cipher = None  # type: ignore[assignment]
 
 
 class _AesCbcEncryptWriter(EncryptWriter):
@@ -459,8 +460,9 @@ class _AesCbcEncryptWriter(EncryptWriter):
         if self._padder and self._cipher:
             final_padding = self._padder.finalize()
             self._dest.write(self._cipher.update(final_padding))
-        self._padder = None
-        self._cipher = None
+        # Set to None to help catch any use after close bugs
+        self._padder = None  # type: ignore[assignment]
+        self._cipher = None  # type: ignore[assignment]
 
 
 class _AesCbcEncryptReader(EncryptReader):
@@ -510,8 +512,9 @@ class _AesCbcEncryptReader(EncryptReader):
 
     def close(self) -> None:
         """Close the encrypt reader."""
-        self._cipher = None
-        self._padder = None
+        # Set to None to help catch any use after close bugs
+        self._cipher = None  # type: ignore[assignment]
+        self._padder = None  # type: ignore[assignment]
 
 
 class AesCbcStreamFactory(CipherStreamFactory):
@@ -592,7 +595,8 @@ class _SecretStreamDecryptReader(DecryptReader):
 
     def close(self) -> None:
         """Close the decrypt reader."""
-        self._state = None
+        # Set to None to help catch any use after close bugs
+        self._state = None  # type: ignore[assignment]
 
 
 class _SecretStreamEncryptWriter(EncryptWriter):
@@ -636,8 +640,9 @@ class _SecretStreamEncryptWriter(EncryptWriter):
                 self._state, self._buffer, None, NSS_TAG_FINAL
             )
             self._dest.write(encrypted)
-            self._buffer = None
-        self._state = None
+        # Set to None to help catch any use after close bugs
+        self._buffer = None  # type: ignore[assignment]
+        self._state = None  # type: ignore[assignment]
 
 
 class _SecretStreamEncryptReader(EncryptReader):
@@ -694,7 +699,8 @@ class _SecretStreamEncryptReader(EncryptReader):
 
     def close(self) -> None:
         """Close the encrypt reader."""
-        self._state = None
+        # Set to None to help catch any use after close bugs
+        self._state = None  # type: ignore[assignment]
 
 
 class SecretStreamFactory(CipherStreamFactory):
