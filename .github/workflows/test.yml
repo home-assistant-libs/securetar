@@ -28,12 +28,12 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-test.txt
           pip install -e .
+      - name: Check formatting with black
+        run: |
+          black securetar tests --check --diff
       - name: Lint with flake8
         run: |
           flake8 securetar tests
-      - name: Check formatting with black
-        run: |
-          black securetar tests --check
       - name: Run tests
         run: |
           pytest tests
