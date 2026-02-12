@@ -1026,7 +1026,9 @@ class SecureTarFile:
             if read_mode:
                 file_mode: int = os.O_RDONLY
             else:
-                file_mode = os.O_WRONLY | os.O_CREAT
+                raise NotImplementedError(
+                    "Writing SecureTarFile to a file path is not supported"
+                )
 
             fd = os.open(self._name, file_mode, 0o666)
             return os.fdopen(fd, "rb" if read_mode else "wb")
