@@ -886,7 +886,6 @@ class SecureTarFile:
 
         Args:
             name: Path to the tar file
-            mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
             bufsize: Buffer size for tarfile I/O operations, passed on to tarfile.TarFile.
             If set to 0, the default buffer size will be used (10240).
             create_version: SecureTar version to create (2 or 3). If None, defaults to 3
