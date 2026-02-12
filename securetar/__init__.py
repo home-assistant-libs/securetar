@@ -892,8 +892,8 @@ class SecureTarFile:
 
         Args:
             name: Path to the tar file
-            mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
-            bufsize: Buffer size for I/O operations
+            bufsize: Buffer size for tarfile I/O operations, passed on to tarfile.TarFile.
+            If set to 0, the default buffer size will be used (10240).
             create_version: SecureTar version to create (2 or 3). If None, defaults to 3
             derived_key_id: Optional derived key ID for deriving key material. Mutually
             exclusive with password.
@@ -1277,7 +1277,8 @@ class SecureTarArchive:
         Args:
             name: Path to the tar file
             mode: File mode ('r' for read, 'w' for write, 'x' for exclusive create)
-            bufsize: Buffer size for I/O operations
+            bufsize: Buffer size for tarfile I/O operations, passed on to tarfile.TarFile.
+            If set to 0, the default buffer size will be used (10240).
             create_version: SecureTar version to create (2 or 3). If None, defaults to 3
             fileobj: File object to use instead of opening a file
             password: Password for encryption/decryption of inner tar files. Mutually
