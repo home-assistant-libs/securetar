@@ -34,6 +34,9 @@ jobs:
       - name: Check formatting with black
         run: |
           black securetar tests --check
+      - name: Lint with mypy
+        run: |
+          mypy --strict securetar
       - name: Run tests
         run: |
           pytest tests
