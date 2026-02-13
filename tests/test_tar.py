@@ -1646,6 +1646,45 @@ def test_innersecuretarfile_error_handling(
         )
 
 
+@pytest.mark.parametrize(
+    ("params", "expected_result"),
+    [
+        # Writing to a file path is supported for non encrypted InnerSecureTarFile
+        (
+            {"root_key_context": None},
+            does_not_raise(),
+        ),
+        # Writing to a file path is not supported for encrypted InnerSecureTarFile
+        (
+            {"root_key_context": Mock()},
+            pytest.raises(
+                NotImplementedError,
+                match="Writing SecureTarFile to a file path is not supported",
+            ),
+        ),
+    ],
+)
+def test_innersecuretarfile_open_error_handling(
+    params: dict[str, Any],
+    expected_result: AbstractContextManager[None],
+) -> None:
+    """Test SecureTarFile.open error handling."""
+    outer_tar = Mock()
+    outer_tar.fileobj = None
+    outer_tar.format = tarfile.PAX_FORMAT
+    istf = InnerSecureTarFile(
+        outer_tar=outer_tar,
+        name=Mock(),
+        bufsize=1024,
+        create_version=2,
+        derived_key_id=None,
+        gzip=False,
+        **params,
+    )
+    with expected_result:
+        istf.open()
+
+
 def test_securetarfile_validate_password_unencrypted(tmp_path: Path) -> None:
     """Test SecureTarFile.validate_password specify derived key without encryption."""
     main_tar = tmp_path.joinpath("test.tar")
