@@ -985,7 +985,7 @@ class SecureTarFile:
         # Set up key context
         self._root_key_context: SecureTarRootKeyContext | None = None
         if self._encrypted:
-            if password:
+            if password is not None:
                 self._root_key_context = SecureTarRootKeyContext(password)
             else:
                 self._root_key_context = root_key_context
@@ -1351,7 +1351,7 @@ class SecureTarArchive:
 
         # Set up key context
         self._root_key_context = root_key_context
-        if password:
+        if password is not None:
             self._root_key_context = SecureTarRootKeyContext(password)
 
     def __enter__(self) -> SecureTarArchive:
