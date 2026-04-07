@@ -119,6 +119,55 @@ MOD_WRITE = "w"
 DEFAULT_CIPHER_VERSION = 3
 
 
+def _secretstream_overhead(plaintext_size: int) -> int:
+    """Calculate the secretstream overhead for a given plaintext size."""
+    # Calculate number of chunks using integer ceiling division to avoid
+    # rounding issues, and ensure at least 1 chunk for empty plaintext
+    num_chunks = (
+        plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
+    ) // V3_SECRETSTREAM_CHUNK_SIZE
+    if num_chunks == 0:
+        num_chunks = 1
+    return num_chunks * V3_SECRETSTREAM_ABYTES
+
+
+def get_archive_max_ciphertext_size(
+    plaintext_size: int, version: int, number_of_inner_tar_files: int
+) -> int:
+    """Calculate the maximum ciphertext size for an archive."""
+
+    if version not in (2, 3):
+        raise ValueError(f"Unsupported SecureTar version: {version}")
+    if number_of_inner_tar_files == 0:
+        return plaintext_size
+    if version == 2:
+        # For v2, the ciphertext size is the plaintext size plus one tar block of
+        # padding per inner tar file in case adding the v2 header crosses a RECORDSIZE
+        # boundary.
+        return plaintext_size + number_of_inner_tar_files * tarfile.RECORDSIZE
+
+    # For v3, the ciphertext size is the plaintext size plus:
+    # - One RECORDSIZE per inner tar file to cover:
+    #   - The v3 header (136 bytes), which may push the entry past a RECORDSIZE
+    #     boundary.
+    #   - The per-file secretstream overhead rounding: the total secretstream
+    #     overhead below is computed from the aggregate plaintext size, but each
+    #     inner file has its own secretstream with at least one chunk, so the
+    #     actual overhead can exceed the aggregate estimate by up to 17 bytes
+    #     per file.
+    # - The total overhead of the secretstream encryption, which is:
+    #   - 17 bytes per 1 MB (V3_SECRETSTREAM_CHUNK_SIZE) of plaintext, padded to
+    #     the next multiple of RECORDSIZE.
+    secretstream_overhead = _secretstream_overhead(plaintext_size)
+
+    # Calculate the number of tar records needed to store the secretstream overhead
+    num_records = (secretstream_overhead + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE
+
+    return (
+        plaintext_size + (number_of_inner_tar_files + num_records) * tarfile.RECORDSIZE
+    )
+
+
 class CipherMode(enum.Enum):
     """Cipher mode."""
 
@@ -544,16 +593,9 @@ class _SecretStreamDecryptReader(DecryptReader):
         if plaintext_size is None:
             raise ValueError("Plaintext size is required")
 
-        # Calculate number of chunks using integer ceiling division to avoid
-        # rounding issues, and ensure at least 1 chunk for empty plaintext
-        num_chunks = (
-            plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
-        ) // V3_SECRETSTREAM_CHUNK_SIZE
-        if num_chunks == 0:
-            num_chunks = 1
         # Calculate ciphertext size based on plaintext size which is always
         # known for v3
-        ciphertext_size = plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES
+        ciphertext_size = plaintext_size + _secretstream_overhead(plaintext_size)
 
         super().__init__(source, key_material, ciphertext_size, plaintext_size)
         self._pos = 0
@@ -659,15 +701,8 @@ class _SecretStreamEncryptReader(EncryptReader):
     ) -> None:
         """Initialize."""
         super().__init__(source, key_material, plaintext_size)
-        # Calculate number of chunks using integer ceiling division to avoid
-        # rounding issues, and ensure at least 1 chunk for empty plaintext
-        num_chunks = (
-            plaintext_size + V3_SECRETSTREAM_CHUNK_SIZE - 1
-        ) // V3_SECRETSTREAM_CHUNK_SIZE
-        if num_chunks == 0:
-            num_chunks = 1
         # Calculate ciphertext size
-        self._ciphertext_size = plaintext_size + num_chunks * V3_SECRETSTREAM_ABYTES
+        self._ciphertext_size = plaintext_size + _secretstream_overhead(plaintext_size)
 
         self._pos = 0
 
