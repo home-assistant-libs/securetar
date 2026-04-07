@@ -32,6 +32,7 @@ from securetar import (
     SecureTarReadError,
     SecureTarRootKeyContext,
     atomic_contents_add,
+    get_archive_max_ciphertext_size,
     secure_path,
 )
 
@@ -66,6 +67,49 @@ class TarInfo:
     """Fake TarInfo."""
 
     name: str
+
+
+@pytest.mark.parametrize(
+    ("version", "number_of_inner_tar_files", "plaintext_size", "expected"),
+    [
+        # v2: plaintext_size + n * RECORDSIZE
+        (2, 0, 0, 0),  # no inner files, no encryption overhead
+        (2, 0, 10240, 10240),  # no inner files, no encryption overhead
+        (2, 1, 10240, 20480),
+        (2, 3, 100000, 130720),
+        # v3: plaintext_size + (n + num_records) * RECORDSIZE
+        # where num_records = ceil(ceil(plaintext/1MB) * 17 / RECORDSIZE), min 1 chunk
+        (3, 0, 0, 0),  # no inner files, no encryption overhead
+        (3, 0, 10240, 10240),  # no inner files, no encryption overhead
+        (3, 1, 10240, 30720),
+        (3, 3, 100000, 140960),
+        (3, 1, 1048576, 1069056),  # exactly 1 MB: 1 chunk
+        (3, 1, 1048577, 1069057),  # 1 MB + 1: 2 chunks, still fits in 1 record
+        (3, 5, 5242880, 5304320),  # 5 MB, 5 files
+        (3, 1, 10485760, 10506240),  # 10 MB: 10 chunks * 17 = 170 bytes, 1 record
+        (3, 10, 1000, 113640),  # many small files
+    ],
+)
+def test_get_archive_max_ciphertext_size(
+    version: int,
+    number_of_inner_tar_files: int,
+    plaintext_size: int,
+    expected: int,
+) -> None:
+    """Test get_archive_max_ciphertext_size."""
+    assert (
+        get_archive_max_ciphertext_size(
+            plaintext_size, version, number_of_inner_tar_files
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("version", [1, 4])
+def test_get_archive_max_ciphertext_size_invalid_version(version: int) -> None:
+    """Test get_archive_max_ciphertext_size with an unsupported version."""
+    with pytest.raises(ValueError, match=f"Unsupported SecureTar version: {version}"):
+        get_archive_max_ciphertext_size(10240, version, 1)
 
 
 def test_secure_path() -> None:
