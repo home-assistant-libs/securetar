@@ -9,7 +9,7 @@ import shutil
 import tarfile
 import time
 from pathlib import Path, PurePath
-from typing import Any
+from typing import IO, Any
 from unittest.mock import Mock, patch
 
 import nacl
@@ -1385,6 +1385,39 @@ def test_secretstream_errors(
                         pass
 
 
+@pytest.mark.parametrize(
+    ("tar_name", "password", "expected_exception"),
+    [
+        ("core_empty.tar.gz", "hunter2", nacl.exceptions.ValueError),
+        ("core_early_final_tag.tar.gz", "wrong", InvalidPasswordError),
+    ],
+)
+def test_securetarfile_open_failure_closes_file(
+    tar_name: str, password: str, expected_exception: type[Exception]
+) -> None:
+    """Test SecureTarFile.open closes the file it opened when opening fails.
+
+    Opening the tar in stream mode reads the first block right away, so a bad
+    password or corrupt data raises inside open() before __exit__ can run.
+    """
+    tar_path = Path(__file__).parent.joinpath("fixtures", tar_name)
+    opened_files: list[IO[bytes]] = []
+    real_fdopen = os.fdopen
+
+    def _fdopen(fd: int, *args: Any, **kwargs: Any) -> IO[bytes]:
+        file = real_fdopen(fd, *args, **kwargs)
+        opened_files.append(file)
+        return file
+
+    with patch("securetar.os.fdopen", _fdopen):
+        with pytest.raises(expected_exception):
+            with SecureTarFile(tar_path, password=password):
+                pass
+
+    assert len(opened_files) == 1
+    assert opened_files[0].closed
+
+
 def test_outer_tar_open_close(tmp_path: Path) -> None:
     # Prepare test folder
     temp_orig = tmp_path.joinpath("orig")
@@ -1754,6 +1787,7 @@ def test_innersecuretarfile_error_handling(
     ],
 )
 def test_innersecuretarfile_open_error_handling(
+    tmp_path: Path,
     params: dict[str, Any],
     expected_result: AbstractContextManager[None],
 ) -> None:
@@ -1763,7 +1797,7 @@ def test_innersecuretarfile_open_error_handling(
     outer_tar.format = tarfile.PAX_FORMAT
     istf = InnerSecureTarFile(
         outer_tar=outer_tar,
-        name=Mock(),
+        name=tmp_path.joinpath("inner.tar"),
         bufsize=1024,
         create_version=2,
         derived_key_id=None,
@@ -1772,6 +1806,7 @@ def test_innersecuretarfile_open_error_handling(
     )
     with expected_result:
         istf.open()
+    istf.close()
 
 
 def test_securetarfile_validate_password_unencrypted(tmp_path: Path) -> None:
