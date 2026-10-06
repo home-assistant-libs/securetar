@@ -612,7 +612,7 @@ def test_tar_inside_tar(
     # Restore
     temp_new = tmp_path.joinpath("new")
     with SecureTarFile(main_tar, gzip=False) as tar_file:
-        tar_file.extractall(path=temp_new)
+        tar_file.extractall(path=temp_new, filter="fully_trusted")
 
     assert temp_new.is_dir()
     core_tar = temp_new.joinpath(inner_tar_files[0])
@@ -635,7 +635,9 @@ def test_tar_inside_tar(
         with SecureTarFile(
             temp_new.joinpath(inner_tar_file), gzip=enable_gzip
         ) as tar_file:
-            tar_file.extractall(path=temp_inner_new, members=tar_file)
+            tar_file.extractall(
+                path=temp_inner_new, members=tar_file, filter="fully_trusted"
+            )
 
         assert temp_inner_new.is_dir()
         assert temp_inner_new.joinpath("test_symlink").is_symlink()
@@ -885,7 +887,7 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
     # Restore
     temp_new = tmp_path.joinpath("new")
     with SecureTarFile(main_tar, gzip=False) as tar_file:
-        tar_file.extractall(path=temp_new)
+        tar_file.extractall(path=temp_new, filter="fully_trusted")
 
     assert temp_new.is_dir()
     assert temp_new.joinpath("good.tar.gz").is_file()
@@ -897,7 +899,9 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
     temp_inner_new = tmp_path.joinpath("good.tar.gz_inner_new")
 
     with SecureTarFile(temp_new.joinpath("good.tar.gz"), gzip=True) as tar_file:
-        tar_file.extractall(path=temp_inner_new, members=tar_file)
+        tar_file.extractall(
+            path=temp_inner_new, members=tar_file, filter="fully_trusted"
+        )
 
     assert temp_inner_new.is_dir()
     assert temp_inner_new.joinpath("test_symlink").is_symlink()
@@ -915,7 +919,9 @@ def test_gzipped_tar_inside_tar_failure(tmp_path: Path) -> None:
     temp_inner_new = tmp_path.joinpath("failed.tar.gz_inner_new")
 
     with SecureTarFile(temp_new.joinpath("failed.tar.gz"), gzip=True) as tar_file:
-        tar_file.extractall(path=temp_inner_new, members=tar_file)
+        tar_file.extractall(
+            path=temp_inner_new, members=tar_file, filter="fully_trusted"
+        )
 
 
 @pytest.mark.parametrize("bufsize", [33, 333, 10240, 4 * 2**20])
@@ -1028,7 +1034,7 @@ def test_encrypted_tar_inside_tar(
     # Restore
     temp_new = tmp_path.joinpath("new")
     with SecureTarFile(main_tar, gzip=False, bufsize=bufsize) as tar_file:
-        tar_file.extractall(path=temp_new)
+        tar_file.extractall(path=temp_new, filter="fully_trusted")
 
     assert temp_new.is_dir()
     for inner_tar_file in inner_tar_files:
@@ -1044,7 +1050,9 @@ def test_encrypted_tar_inside_tar(
             gzip=enable_gzip,
             bufsize=bufsize,
         ) as tar_file:
-            tar_file.extractall(path=temp_inner_new, members=tar_file)
+            tar_file.extractall(
+                path=temp_inner_new, members=tar_file, filter="fully_trusted"
+            )
 
         assert temp_inner_new.is_dir()
         assert temp_inner_new.joinpath("test_symlink").is_symlink()
@@ -1442,7 +1450,7 @@ def test_outer_tar_open_close(tmp_path: Path) -> None:
     # Restore
     temp_new = tmp_path.joinpath("new")
     with SecureTarFile(main_tar, gzip=False) as tar_file:
-        tar_file.extractall(path=temp_new, members=tar_file)
+        tar_file.extractall(path=temp_new, members=tar_file, filter="fully_trusted")
 
     assert temp_new.is_dir()
     assert temp_new.joinpath("any.tgz").is_file()
