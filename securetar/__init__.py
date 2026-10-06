@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Generator, Hashable
+from collections.abc import Callable, Hashable
 import copy
 import enum
 import hashlib
 import hmac
-import logging
 import os
 import struct
 import tarfile
@@ -34,8 +33,6 @@ from nacl.exceptions import CryptoError
 from nacl.hash import blake2b
 from nacl.pwhash.argon2id import kdf, SALTBYTES as ARGON2_SALT_SIZE
 from nacl.utils import random as nacl_random
-
-_LOGGER: logging.Logger = logging.getLogger(__name__)
 
 # Sizes for AES, used in v1 and v2
 AES_BLOCK_SIZE = 16
@@ -1808,23 +1805,6 @@ class SecureTarRootKeyContext:
         """Reconstruct key material from existing header fields."""
         strategy = self._ensure_strategy(header.version, header)
         return strategy.get_key_material(header.cipher_initialization)
-
-
-def secure_path(tar: tarfile.TarFile) -> Generator[tarfile.TarInfo, None, None]:
-    """Security safe check of path.
-    Prevent ../ or absolut paths
-    """
-    for member in tar:
-        file_path = Path(member.name)
-        try:
-            if file_path.is_absolute():
-                raise ValueError()
-            Path("/fake", file_path).resolve().relative_to("/fake")
-        except (ValueError, RuntimeError):
-            _LOGGER.warning("Found issue with file %s", file_path)
-            continue
-        else:
-            yield member
 
 
 def atomic_contents_add(

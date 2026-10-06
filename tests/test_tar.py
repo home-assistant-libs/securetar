@@ -8,7 +8,6 @@ import os
 import shutil
 import tarfile
 import time
-from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import Any
 from unittest.mock import Mock, patch
@@ -16,6 +15,7 @@ from unittest.mock import Mock, patch
 import nacl
 import pytest
 
+import securetar
 from securetar import (
     SECURETAR_MAGIC,
     SECURETAR_V2_HEADER_SIZE,
@@ -33,7 +33,6 @@ from securetar import (
     SecureTarRootKeyContext,
     atomic_contents_add,
     get_archive_max_ciphertext_size,
-    secure_path,
 )
 
 
@@ -60,13 +59,6 @@ get_ciphertext_size: dict[int, Callable[[int], int]] = {
     2: get_ciphertext_size_v2,
     3: get_ciphertext_size_v3,
 }
-
-
-@dataclass
-class TarInfo:
-    """Fake TarInfo."""
-
-    name: str
 
 
 @pytest.mark.parametrize(
@@ -112,25 +104,9 @@ def test_get_archive_max_ciphertext_size_invalid_version(version: int) -> None:
         get_archive_max_ciphertext_size(10240, version, 1)
 
 
-def test_secure_path() -> None:
-    """Test Secure Path."""
-    test_list = [
-        TarInfo("test.txt"),
-        TarInfo("data/xy.blob"),
-        TarInfo("bla/blu/ble"),
-        TarInfo("data/../xy.blob"),
-    ]
-    assert test_list == list(secure_path(test_list))
-
-
-def test_not_secure_path() -> None:
-    """Test Not secure path."""
-    test_list = [
-        TarInfo("/test.txt"),
-        TarInfo("data/../../xy.blob"),
-        TarInfo("/bla/blu/ble"),
-    ]
-    assert [] == list(secure_path(test_list))
+def test_secure_path_removed() -> None:
+    """Test the obsolete secure_path helper is no longer exposed."""
+    assert not hasattr(securetar, "secure_path")
 
 
 @pytest.mark.parametrize(
