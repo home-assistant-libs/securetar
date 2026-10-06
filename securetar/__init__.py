@@ -1495,6 +1495,13 @@ class SecureTarArchive:
         ) as encrypted:
             encrypted_tar_info = copy.deepcopy(member)
             encrypted_tar_info.size = encrypted.ciphertext_size
+            # If the source member was larger than 8 GiB, tarfile stored its
+            # size in a PAX "size" record when reading. TarInfo.tobuf gives
+            # an existing PAX record priority over the size attribute, so drop
+            # it to make sure the ciphertext size is written.
+            encrypted_tar_info.pax_headers = {
+                key: value for key, value in member.pax_headers.items() if key != "size"
+            }
             self._tar.addfile(encrypted_tar_info, encrypted)
 
     def _validate(self, member: tarfile.TarInfo, *, basic_validation: bool) -> bool:
