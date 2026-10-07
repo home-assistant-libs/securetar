@@ -8,9 +8,9 @@ encrypted. It is the archive format used for Home Assistant backups.
 
 ## Archive layout
 
-A SecureTar archive is a plain, uncompressed outer tar in PAX format. Each
-member of the outer tar is an inner tar file, optionally gzip compressed and
-optionally encrypted. Metadata files such as `backup.json` can be added to
+A SecureTar archive is a plain, uncompressed outer tar in PAX format. Its
+members are either inner tar files, optionally gzip compressed and optionally
+encrypted, or plain metadata files such as `backup.json` that are added to
 the outer tar directly.
 
 Encrypted inner tar files start with a SecureTar header followed by the
@@ -132,7 +132,10 @@ several `SecureTarArchive` instances instead of a password.
 
 Passing the same `derived_key_id` to `create_tar` or `import_tar` reuses the
 per-file key and nonce, so importing the same plaintext tar into two archives
-produces byte-identical ciphertext. Use this only when identical output is
+produces byte-identical ciphertext. Reusing a key and nonce for different
+plaintext breaks the encryption, so an ID must identify exactly one plaintext.
+Tar member names are not guaranteed to be unique, so the example below keys on
+the member's position as well. Use this only when identical output is
 required, for example to upload one backup to several locations; otherwise
 leave `derived_key_id` unset so every inner tar gets a fresh key.
 
@@ -144,8 +147,10 @@ root_key_context = SecureTarRootKeyContext("hunter2")
 with SecureTarArchive(Path("plain.tar"), "r") as source:
     for name in ("backup1.tar", "backup2.tar"):
         with SecureTarArchive(Path(name), "w", root_key_context=root_key_context) as target:
-            for member in source.tar:
+            for index, member in enumerate(source.tar):
                 target.import_tar(
-                    source.tar.extractfile(member), member, derived_key_id=member.name
+                    source.tar.extractfile(member),
+                    member,
+                    derived_key_id=(index, member.name),
                 )
 ```
