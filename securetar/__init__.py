@@ -1319,9 +1319,10 @@ class _MemberView(io.RawIOBase):
     outer file without relying on a shared file position.
     """
 
-    def __init__(self, offset: int, size: int) -> None:
-        """Initialize the view with the member's data offset and size."""
+    def __init__(self, archive: SecureTarArchive, offset: int, size: int) -> None:
+        """Initialize the view with the owning archive, data offset and size."""
         super().__init__()
+        self._archive = archive
         self._offset = offset
         self._size = size
         self._pos = 0
@@ -1363,6 +1364,8 @@ class _MemberView(io.RawIOBase):
         count = min(len(buffer), self._size - self._pos)
         if count <= 0:
             return 0
+        if self._archive.closed:
+            raise SecureTarError("Archive is closed")
         data = self._read_at(self._offset + self._pos, count)
         buffer[: len(data)] = data
         self._pos += len(data)
@@ -1376,9 +1379,11 @@ class _PreadMemberView(_MemberView):
     used concurrently from different threads on the same descriptor.
     """
 
-    def __init__(self, fd: int, offset: int, size: int) -> None:
+    def __init__(
+        self, archive: SecureTarArchive, fd: int, offset: int, size: int
+    ) -> None:
         """Initialize the view with a file descriptor."""
-        super().__init__(offset, size)
+        super().__init__(archive, offset, size)
         self._fd = fd
 
     def _read_at(self, offset: int, count: int) -> bytes:
@@ -1392,9 +1397,11 @@ class _ReopenMemberView(_MemberView):
     is closed together with the view.
     """
 
-    def __init__(self, name: Path, offset: int, size: int) -> None:
+    def __init__(
+        self, archive: SecureTarArchive, name: Path, offset: int, size: int
+    ) -> None:
         """Initialize the view by reopening the archive file."""
-        super().__init__(offset, size)
+        super().__init__(archive, offset, size)
         self._file = open(name, "rb", buffering=0)
 
     def _read_at(self, offset: int, count: int) -> bytes:
@@ -1500,6 +1507,11 @@ class SecureTarArchive:
             self._tar = None
 
     @property
+    def closed(self) -> bool:
+        """Return True if the archive is not open."""
+        return self._tar is None
+
+    @property
     def tar(self) -> tarfile.TarFile:
         """Return the underlying tar file."""
         if not self._tar:
@@ -1589,7 +1601,7 @@ class SecureTarArchive:
         Readers access the archive file independently of the archive's own
         file position and may be used concurrently from different threads.
         The archive must stay open while readers are in use; a reader used
-        after the archive is closed fails with an OSError (possibly wrapped in
+        after the archive is closed raises SecureTarError (possibly wrapped in
         a tarfile.ReadError) rather than returning corrupted data.
 
         Args:
@@ -1598,8 +1610,8 @@ class SecureTarArchive:
 
         Raises:
             SecureTarError: If the archive is not open for reading, the member
-            is not a regular file, or the archive file cannot be accessed
-            independently (non-file fileobj without a path).
+            is not a regular file, or the archive was constructed from a
+            fileobj without a file descriptor.
         """
         if not self._tar:
             raise SecureTarError("Archive not open")
@@ -1621,9 +1633,12 @@ class SecureTarArchive:
             except (AttributeError, OSError, ValueError):
                 fd = None
         if fd is not None:
-            raw = _PreadMemberView(fd, member.offset_data, member.size)
-        elif self._name is not None:
-            raw = _ReopenMemberView(self._name, member.offset_data, member.size)
+            raw = _PreadMemberView(self, fd, member.offset_data, member.size)
+        elif self._fileobj is None and self._name is not None:
+            # The archive opened the path itself, so reopening it reads the
+            # same bytes tarfile parsed. A caller-supplied fileobj may differ
+            # from the path, so it is never substituted.
+            raw = _ReopenMemberView(self, self._name, member.offset_data, member.size)
         else:
             raise SecureTarError(
                 "Cannot open inner tar: archive fileobj has no file descriptor"

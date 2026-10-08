@@ -2,7 +2,6 @@
 
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import AbstractContextManager, nullcontext as does_not_raise
-import errno
 import gzip
 import io
 import os
@@ -2234,15 +2233,15 @@ def test_securetararchive_open_tar_after_close(
     with archive:
         member = archive.tar.getmember(inner_tar_file)
         inner = archive.open_tar(member, gzip=enable_gzip)
-    # tarfile wraps the OSError in ReadError when opening a gzip stream
-    with pytest.raises((OSError, tarfile.ReadError)) as exc_info:
+    # tarfile wraps the error in ReadError when opening a gzip stream
+    with pytest.raises((SecureTarError, tarfile.ReadError)) as exc_info:
         with inner as inner_tar:
             inner_tar.getnames()
     err: BaseException | None = exc_info.value
-    while err is not None and not isinstance(err, OSError):
+    while err is not None and not isinstance(err, SecureTarError):
         err = err.__cause__
-    assert isinstance(err, OSError)
-    assert err.errno == errno.EBADF
+    assert isinstance(err, SecureTarError)
+    assert str(err) == "Archive is closed"
 
 
 @pytest.mark.parametrize("password", [None, "hunter2"])
@@ -2278,26 +2277,57 @@ def test_securetararchive_open_tar_reopen_fallback(
         assert inner._fileobj.closed
         _assert_extracted_inner_tar(temp_new)
 
+        with patch(
+            "securetar.hasattr", create=True, side_effect=lambda o, n: n != "pread"
+        ):
+            inner = archive.open_tar(member, gzip=enable_gzip)
+    # Reader fails once the archive is closed, even though it owns its handle
+    with pytest.raises((SecureTarError, tarfile.ReadError)) as exc_info:
+        with inner as inner_tar:
+            inner_tar.getnames()
+    assert "Archive is closed" in str(exc_info.value) or "Archive is closed" in str(
+        exc_info.value.__cause__
+    )
 
-def test_securetararchive_open_tar_fileobj_no_fileno(tmp_path: Path) -> None:
-    """Test open_tar with a BytesIO fileobj and no name raises."""
+
+@pytest.mark.parametrize("with_name", [False, True])
+def test_securetararchive_open_tar_fileobj_no_fileno(
+    tmp_path: Path, with_name: bool
+) -> None:
+    """Test open_tar with a BytesIO fileobj raises, even if a name is given.
+
+    The name is never used as a substitute for a caller-supplied fileobj as
+    the two may not contain the same bytes.
+    """
     main_tar, _ = _create_inner_tar_archive(
         tmp_path, enable_gzip=False, inner_tar_files=("core.tar",), password=None
     )
     fileobj = io.BytesIO(main_tar.read_bytes())
-    with SecureTarArchive(fileobj=fileobj, mode="r") as archive:
+    with SecureTarArchive(
+        main_tar if with_name else None, fileobj=fileobj, mode="r"
+    ) as archive:
         member = archive.tar.getmember("core.tar")
         with pytest.raises(SecureTarError, match="has no file descriptor"):
             archive.open_tar(member, gzip=False)
 
-    # With a name, the reopen fallback is used
-    fileobj = io.BytesIO(main_tar.read_bytes())
-    with SecureTarArchive(main_tar, fileobj=fileobj, mode="r") as archive:
-        member = archive.tar.getmember("core.tar")
-        temp_new = tmp_path.joinpath("new")
-        with archive.open_tar(member, gzip=False) as inner_tar:
-            inner_tar.extractall(path=temp_new, filter="fully_trusted")
-        _assert_extracted_inner_tar(temp_new)
+
+def test_securetararchive_open_tar_fileobj_with_fileno(tmp_path: Path) -> None:
+    """Test open_tar with a caller-supplied real file object."""
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path, enable_gzip=False, inner_tar_files=("core.tar",), password=None
+    )
+    with open(main_tar, "rb") as fileobj:
+        with SecureTarArchive(fileobj=fileobj, mode="r") as archive:
+            member = archive.tar.getmember("core.tar")
+            temp_new = tmp_path.joinpath("new")
+            with archive.open_tar(member, gzip=False) as inner_tar:
+                inner_tar.extractall(path=temp_new, filter="fully_trusted")
+            _assert_extracted_inner_tar(temp_new)
+            inner = archive.open_tar(member, gzip=False)
+        # Reader fails once the archive is closed, even though fileobj is open
+        with pytest.raises(SecureTarError, match="Archive is closed"):
+            with inner as inner_tar:
+                inner_tar.getnames()
 
 
 def test_member_view_seek() -> None:
@@ -2307,7 +2337,8 @@ def test_member_view_seek() -> None:
     os.close(read)
     os.close(write)
     with open(os.devnull, "rb") as devnull:
-        view = securetar._PreadMemberView(devnull.fileno(), 0, len(data))
+        archive = Mock(closed=False)
+        view = securetar._PreadMemberView(archive, devnull.fileno(), 0, len(data))
         assert view.seekable() and view.readable()
         assert view.seek(3) == 3
         assert view.tell() == 3
