@@ -2311,6 +2311,7 @@ def test_securetararchive_open_tar_fileobj_no_fileno(
             archive.open_tar(member, gzip=False)
 
 
+@pytest.mark.skipif(not hasattr(os, "pread"), reason="requires os.pread")
 def test_securetararchive_open_tar_fileobj_with_fileno(tmp_path: Path) -> None:
     """Test open_tar with a caller-supplied real file object."""
     main_tar, _ = _create_inner_tar_archive(
@@ -2328,6 +2329,45 @@ def test_securetararchive_open_tar_fileobj_with_fileno(tmp_path: Path) -> None:
         with pytest.raises(SecureTarError, match="Archive is closed"):
             with inner as inner_tar:
                 inner_tar.getnames()
+
+
+def test_securetararchive_open_tar_fileobj_no_pread(tmp_path: Path) -> None:
+    """Test open_tar with a caller-supplied file object without os.pread."""
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path, enable_gzip=False, inner_tar_files=("core.tar",), password=None
+    )
+    with open(main_tar, "rb") as fileobj:
+        with SecureTarArchive(main_tar, fileobj=fileobj, mode="r") as archive:
+            member = archive.tar.getmember("core.tar")
+            with patch(
+                "securetar.hasattr", create=True, side_effect=lambda o, n: n != "pread"
+            ):
+                with pytest.raises(SecureTarError, match="without os.pread"):
+                    archive.open_tar(member, gzip=False)
+
+
+@pytest.mark.parametrize("enable_gzip", [True, False])
+def test_securetararchive_open_tar_malformed_plain_member(
+    tmp_path: Path, enable_gzip: bool
+) -> None:
+    """Test the owned view is closed when opening a malformed plain member fails."""
+    main_tar = tmp_path.joinpath("test.tar")
+    raw_bytes = b"this is not a tar" * 100
+    with SecureTarArchive(name=main_tar, mode="w") as archive:
+        tar_info = tarfile.TarInfo(name="bad.tar")
+        tar_info.size = len(raw_bytes)
+        archive.tar.addfile(tar_info, fileobj=io.BytesIO(raw_bytes))
+
+    with SecureTarArchive(name=main_tar, mode="r") as archive:
+        member = archive.tar.getmember("bad.tar")
+        with patch(
+            "securetar.hasattr", create=True, side_effect=lambda o, n: n != "pread"
+        ):
+            inner = archive.open_tar(member, gzip=enable_gzip)
+        assert isinstance(inner._fileobj.raw, securetar._ReopenMemberView)
+        with pytest.raises(tarfile.ReadError):
+            inner.open()
+        assert inner._fileobj.closed
 
 
 def test_member_view_seek() -> None:

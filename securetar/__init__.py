@@ -1002,15 +1002,20 @@ class SecureTarFile:
         """
         if not self._encrypted:
             # Plain tar, no encryption
-            # Ignore mypy because of typing issues with the mode and extra args
-            self._tar = tarfile.open(  # type: ignore[call-overload]
-                name=str(self._name),
-                mode=self._tar_mode,
-                dereference=False,
-                bufsize=self._bufsize,
-                fileobj=self._fileobj,
-                **self._extra_tar_args,
-            )
+            try:
+                # Ignore mypy because of typing issues with the mode and extra args
+                self._tar = tarfile.open(  # type: ignore[call-overload]
+                    name=str(self._name),
+                    mode=self._tar_mode,
+                    dereference=False,
+                    bufsize=self._bufsize,
+                    fileobj=self._fileobj,
+                    **self._extra_tar_args,
+                )
+            except BaseException:
+                # Release a fileobj we own (see SecureTarArchive.open_tar)
+                self.close()
+                raise
             return self._tar
 
         # When encrypted, we have root key context
@@ -1600,6 +1605,11 @@ class SecureTarArchive:
 
         Readers access the archive file independently of the archive's own
         file position and may be used concurrently from different threads.
+        On POSIX this uses positional reads on the archive's file descriptor.
+        On platforms without os.pread, the archive file is reopened per
+        reader, which requires the archive to have been opened from a path
+        rather than a fileobj.
+
         The archive must stay open while readers are in use; a reader used
         after the archive is closed raises SecureTarError (possibly wrapped in
         a tarfile.ReadError) rather than returning corrupted data.
@@ -1611,7 +1621,8 @@ class SecureTarArchive:
         Raises:
             SecureTarError: If the archive is not open for reading, the member
             is not a regular file, or the archive was constructed from a
-            fileobj without a file descriptor.
+            fileobj that cannot be read independently (no file descriptor, or
+            no os.pread on this platform).
         """
         if not self._tar:
             raise SecureTarError("Archive not open")
@@ -1639,6 +1650,11 @@ class SecureTarArchive:
             # same bytes tarfile parsed. A caller-supplied fileobj may differ
             # from the path, so it is never substituted.
             raw = _ReopenMemberView(self, self._name, member.offset_data, member.size)
+        elif self._fileobj is not None and not hasattr(os, "pread"):
+            raise SecureTarError(
+                "Cannot open inner tar: archive fileobj cannot be read "
+                "independently without os.pread on this platform"
+            )
         else:
             raise SecureTarError(
                 "Cannot open inner tar: archive fileobj has no file descriptor"
