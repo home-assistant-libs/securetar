@@ -8,6 +8,7 @@ import copy
 import enum
 import hashlib
 import hmac
+import io
 import os
 import struct
 import tarfile
@@ -907,6 +908,9 @@ class SecureTarFile:
     """Handle tar files, optionally wrapped in an encryption layer."""
 
     _mode: str = "r"
+    # Set when the fileobj was created on behalf of the caller (see
+    # SecureTarArchive.open_tar) and should be closed together with this object.
+    _close_fileobj: bool = False
 
     def __init__(
         self,
@@ -1106,6 +1110,8 @@ class SecureTarFile:
             if not self._fileobj:
                 self._file.close()
             self._file = None
+        if self._fileobj and self._close_fileobj:
+            self._fileobj.close()
 
     def _validate(self, *, basic_validation: bool) -> bool:
         """Validate the data.
@@ -1306,6 +1312,102 @@ class InnerSecureTarFile(SecureTarFile):
         fileobj.seek(end_position + padding_size)
 
 
+class _MemberView(io.RawIOBase):
+    """Bounded, seekable read-only view of one regular member of an outer tar.
+
+    Subclasses implement _read_at() to fetch bytes at an absolute offset in the
+    outer file without relying on a shared file position.
+    """
+
+    def __init__(self, offset: int, size: int) -> None:
+        """Initialize the view with the member's data offset and size."""
+        super().__init__()
+        self._offset = offset
+        self._size = size
+        self._pos = 0
+
+    @abstractmethod
+    def _read_at(self, offset: int, count: int) -> bytes:
+        """Read up to count bytes at absolute offset in the outer file."""
+
+    def readable(self) -> bool:
+        """Return True, the view is readable."""
+        return True
+
+    def seekable(self) -> bool:
+        """Return True, the view is seekable."""
+        return True
+
+    def tell(self) -> int:
+        """Return the current position within the member."""
+        return self._pos
+
+    def seek(self, pos: int, whence: int = io.SEEK_SET) -> int:
+        """Seek within the member."""
+        if whence == io.SEEK_SET:
+            base = 0
+        elif whence == io.SEEK_CUR:
+            base = self._pos
+        elif whence == io.SEEK_END:
+            base = self._size
+        else:
+            raise ValueError(f"Invalid whence: {whence}")
+        new_pos = base + pos
+        if new_pos < 0:
+            raise ValueError(f"Negative seek position {new_pos}")
+        self._pos = new_pos
+        return self._pos
+
+    def readinto(self, buffer: Any) -> int:
+        """Read into buffer, bounded by the member size."""
+        count = min(len(buffer), self._size - self._pos)
+        if count <= 0:
+            return 0
+        data = self._read_at(self._offset + self._pos, count)
+        buffer[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+
+class _PreadMemberView(_MemberView):
+    """Member view using positional reads on the archive's file descriptor.
+
+    os.pread does not touch the shared file position, so multiple views can be
+    used concurrently from different threads on the same descriptor.
+    """
+
+    def __init__(self, fd: int, offset: int, size: int) -> None:
+        """Initialize the view with a file descriptor."""
+        super().__init__(offset, size)
+        self._fd = fd
+
+    def _read_at(self, offset: int, count: int) -> bytes:
+        return os.pread(self._fd, count, offset)
+
+
+class _ReopenMemberView(_MemberView):
+    """Member view owning a separately opened handle to the archive file.
+
+    Used where positional reads are not available (e.g. Windows). The handle
+    is closed together with the view.
+    """
+
+    def __init__(self, name: Path, offset: int, size: int) -> None:
+        """Initialize the view by reopening the archive file."""
+        super().__init__(offset, size)
+        self._file = open(name, "rb", buffering=0)
+
+    def _read_at(self, offset: int, count: int) -> bytes:
+        self._file.seek(offset)
+        return self._file.read(count)
+
+    def close(self) -> None:
+        """Close the view and the owned file handle."""
+        if not self.closed:
+            self._file.close()
+        super().close()
+
+
 class SecureTarArchive:
     """Manage a plain tar archive containing encrypted inner tar files."""
 
@@ -1471,6 +1573,73 @@ class SecureTarArchive:
             ciphertext_size=member.size,
             root_key_context=self._root_key_context,
         )
+
+    def open_tar(
+        self,
+        member: tarfile.TarInfo,
+        *,
+        gzip: bool,
+    ) -> SecureTarFile:
+        """Return a reader for an inner tar stored as a regular member.
+
+        The returned SecureTarFile is unopened; use it as a context manager to
+        get a tarfile.TarFile. It decrypts with the archive's key context when
+        one was given and reads the member plain otherwise.
+
+        Readers access the archive file independently of the archive's own
+        file position and may be used concurrently from different threads.
+        The archive must stay open while readers are in use; a reader used
+        after the archive is closed fails with an OSError (possibly wrapped in
+        a tarfile.ReadError) rather than returning corrupted data.
+
+        Args:
+            member: TarInfo of the inner tar, must be a regular file
+            gzip: Whether the inner tar is gzip compressed
+
+        Raises:
+            SecureTarError: If the archive is not open for reading, the member
+            is not a regular file, or the archive file cannot be accessed
+            independently (non-file fileobj without a path).
+        """
+        if not self._tar:
+            raise SecureTarError("Archive not open")
+
+        if self._mode != MOD_READ:
+            raise SecureTarError("Archive not open for reading")
+
+        if self._streaming:
+            raise SecureTarError("open_tar not supported in streaming mode")
+
+        if not member.isreg() or member.sparse is not None:
+            raise SecureTarError(f"{member.name} is not a regular file")
+
+        raw: _MemberView
+        fd: int | None = None
+        if hasattr(os, "pread"):
+            try:
+                fd = self._tar.fileobj.fileno()  # type: ignore[attr-defined]
+            except (AttributeError, OSError, ValueError):
+                fd = None
+        if fd is not None:
+            raw = _PreadMemberView(fd, member.offset_data, member.size)
+        elif self._name is not None:
+            raw = _ReopenMemberView(self._name, member.offset_data, member.size)
+        else:
+            raise SecureTarError(
+                "Cannot open inner tar: archive fileobj has no file descriptor"
+            )
+
+        view = io.BufferedReader(
+            raw, buffer_size=self._bufsize or io.DEFAULT_BUFFER_SIZE
+        )
+        inner = SecureTarFile(
+            bufsize=self._bufsize,
+            fileobj=view,
+            gzip=gzip,
+            root_key_context=self._root_key_context,
+        )
+        inner._close_fileobj = True
+        return inner
 
     def import_tar(
         self,

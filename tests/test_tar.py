@@ -1,7 +1,8 @@
 """Test Tarfile functions."""
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Iterator
 from contextlib import AbstractContextManager, nullcontext as does_not_raise
+import errno
 import gzip
 import io
 import os
@@ -2000,3 +2001,321 @@ def test_securetarfile_invalid_magic(
     """Test SecureTarFile with invalid magic."""
     with pytest.raises(expected_exception, match=expected_message):
         SecureTarHeader.from_bytes(io.BytesIO(header))
+
+
+def _create_inner_tar_archive(
+    tmp_path: Path,
+    *,
+    enable_gzip: bool,
+    inner_tar_files: tuple[str, ...],
+    password: str | None,
+) -> tuple[Path, Path]:
+    """Create an archive with inner tars, return (archive path, source dir)."""
+    temp_orig = tmp_path.joinpath("orig")
+    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
+    shutil.copytree(fixture_data, temp_orig, symlinks=True)
+
+    main_tar = tmp_path.joinpath("backup.tar")
+    with SecureTarArchive(main_tar, "w", password=password) as archive:
+        for inner_tar_file in inner_tar_files:
+            with archive.create_tar(inner_tar_file, gzip=enable_gzip) as inner_tar:
+                atomic_contents_add(
+                    inner_tar,
+                    temp_orig,
+                    file_filter=lambda _: False,
+                    arcname=".",
+                )
+        raw_bytes = b'{"test": "test"}'
+        tar_info = tarfile.TarInfo(name="backup.json")
+        tar_info.size = len(raw_bytes)
+        archive.tar.addfile(tar_info, fileobj=io.BytesIO(raw_bytes))
+    return main_tar, temp_orig
+
+
+def _assert_extracted_inner_tar(extracted: Path) -> None:
+    """Check the extracted contents of the fixture inner tar."""
+    assert extracted.is_dir()
+    assert extracted.joinpath("test_symlink").is_symlink()
+    assert extracted.joinpath("test1").is_dir()
+    assert extracted.joinpath("test1/script.sh").is_file()
+    assert extracted.joinpath("README.md").is_file()
+    fixture_data = Path(__file__).parent.joinpath("fixtures/tar_data")
+    assert (
+        extracted.joinpath("README.md").read_bytes()
+        == fixture_data.joinpath("README.md").read_bytes()
+    )
+
+
+@pytest.mark.parametrize("bufsize", [333, 10240, 4 * 2**20])
+@pytest.mark.parametrize(
+    ("enable_gzip", "inner_tar_files"),
+    [
+        (True, ("core.tar.gz", "core2.tar.gz", "core3.tar.gz")),
+        (False, ("core.tar", "core2.tar", "core3.tar")),
+    ],
+)
+@pytest.mark.parametrize("password", [None, "hunter2"])
+def test_securetararchive_open_tar(
+    tmp_path: Path,
+    bufsize: int,
+    enable_gzip: bool,
+    inner_tar_files: tuple[str, ...],
+    password: str | None,
+) -> None:
+    """Test SecureTarArchive.open_tar for plain and encrypted inner tars."""
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path,
+        enable_gzip=enable_gzip,
+        inner_tar_files=inner_tar_files,
+        password=password,
+    )
+
+    # Reference: extract the outer tar and open the inner tars from disk
+    temp_ref = tmp_path.joinpath("ref")
+    with tarfile.open(main_tar) as outer:
+        outer.extractall(path=temp_ref, filter="fully_trusted")
+
+    with SecureTarArchive(main_tar, "r", bufsize=bufsize, password=password) as archive:
+        members = {m.name: m for m in archive.tar.getmembers()}
+        assert set(members) == {"backup.json", *inner_tar_files}
+        for inner_tar_file in inner_tar_files:
+            inner = archive.open_tar(members[inner_tar_file], gzip=enable_gzip)
+            assert isinstance(inner, SecureTarFile)
+            if password is not None:
+                # Validation consumes the stream, create a new reader afterwards
+                assert inner.validate_password()
+                inner.close()
+                inner = archive.open_tar(members[inner_tar_file], gzip=enable_gzip)
+            temp_new = tmp_path.joinpath(f"{inner_tar_file}_new")
+            inner_names: list[str] = []
+            with inner as inner_tar:
+                # Encrypted inner tars are streamed, so collect names while
+                # extracting instead of calling getnames() first
+                def _members(tar: tarfile.TarFile) -> Iterator[tarfile.TarInfo]:
+                    for member in tar:
+                        inner_names.append(member.name)
+                        yield member
+
+                inner_tar.extractall(
+                    path=temp_new, members=_members(inner_tar), filter="fully_trusted"
+                )
+            inner_names.sort()
+            _assert_extracted_inner_tar(temp_new)
+
+            # Compare with the inner tar on disk
+            temp_disk = tmp_path.joinpath(f"{inner_tar_file}_disk")
+            with SecureTarFile(
+                temp_ref.joinpath(inner_tar_file), gzip=enable_gzip, password=password
+            ) as disk_tar:
+                disk_names: list[str] = []
+                for disk_member in disk_tar:
+                    disk_names.append(disk_member.name)
+                    disk_tar.extract(
+                        disk_member, path=temp_disk, filter="fully_trusted"
+                    )
+            assert sorted(disk_names) == inner_names
+            _assert_extracted_inner_tar(temp_disk)
+
+
+@pytest.mark.parametrize("password", [None, "hunter2"])
+def test_securetararchive_open_tar_concurrent(
+    tmp_path: Path, password: str | None
+) -> None:
+    """Test readers on different members in different threads."""
+    import threading
+
+    inner_tar_files = ("core.tar.gz", "core2.tar.gz", "core3.tar.gz")
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path, enable_gzip=True, inner_tar_files=inner_tar_files, password=password
+    )
+
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(len(inner_tar_files))
+
+    def extract(member: tarfile.TarInfo, archive: SecureTarArchive) -> None:
+        try:
+            temp_new = tmp_path.joinpath(f"{member.name}_new")
+            barrier.wait()
+            for _ in range(5):
+                with archive.open_tar(member, gzip=True) as inner_tar:
+                    inner_tar.extractall(path=temp_new, filter="fully_trusted")
+                _assert_extracted_inner_tar(temp_new)
+        except BaseException as err:  # noqa: BLE001
+            errors.append(err)
+
+    with SecureTarArchive(main_tar, "r", bufsize=333, password=password) as archive:
+        members = [m for m in archive.tar.getmembers() if m.name in inner_tar_files]
+        threads = [
+            threading.Thread(target=extract, args=(member, archive))
+            for member in members
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert errors == []
+
+
+def test_securetararchive_open_tar_backward_seek(tmp_path: Path) -> None:
+    """Test getmembers() followed by extractall() on a compressed plain member."""
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path, enable_gzip=True, inner_tar_files=("core.tar.gz",), password=None
+    )
+    with SecureTarArchive(main_tar, "r") as archive:
+        member = archive.tar.getmember("core.tar.gz")
+        with archive.open_tar(member, gzip=True) as inner_tar:
+            # Scans to the end of the inner tar
+            names = inner_tar.getnames()
+            assert "README.md" in names
+            # Seeks back to the first member
+            temp_new = tmp_path.joinpath("new")
+            inner_tar.extractall(path=temp_new, filter="fully_trusted")
+        _assert_extracted_inner_tar(temp_new)
+
+
+def test_securetararchive_open_tar_non_regular_member(tmp_path: Path) -> None:
+    """Test SecureTarArchive.open_tar with a non-regular member."""
+    main_tar = tmp_path.joinpath("test.tar")
+    with SecureTarArchive(name=main_tar, mode="w") as archive:
+        dir_info = tarfile.TarInfo("a_dir")
+        dir_info.type = tarfile.DIRTYPE
+        archive.tar.addfile(dir_info)
+        link_info = tarfile.TarInfo("a_link")
+        link_info.type = tarfile.SYMTYPE
+        link_info.linkname = "a_dir"
+        archive.tar.addfile(link_info)
+
+    with SecureTarArchive(name=main_tar, mode="r") as archive:
+        for name in ("a_dir", "a_link"):
+            with pytest.raises(SecureTarError, match=f"{name} is not a regular file"):
+                archive.open_tar(archive.tar.getmember(name), gzip=False)
+
+
+def test_securetararchive_open_tar_before_open() -> None:
+    """Test SecureTarArchive.open_tar call before open."""
+    secure_tar_archive = SecureTarArchive(name=Path("test.tar"), mode="r")
+    with pytest.raises(SecureTarError, match="Archive not open"):
+        secure_tar_archive.open_tar(tarfile.TarInfo("blah"), gzip=False)
+
+
+def test_securetararchive_open_tar_write_mode(tmp_path: Path) -> None:
+    """Test SecureTarArchive.open_tar in write mode."""
+    main_tar = tmp_path.joinpath("test.tar")
+    with SecureTarArchive(name=main_tar, mode="w") as archive:
+        with pytest.raises(SecureTarError, match="Archive not open for reading"):
+            archive.open_tar(tarfile.TarInfo("blah"), gzip=False)
+
+
+def test_securetararchive_open_tar_streaming(tmp_path: Path) -> None:
+    """Test SecureTarArchive.open_tar in streaming mode."""
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path, enable_gzip=False, inner_tar_files=("core.tar",), password=None
+    )
+    with SecureTarArchive(name=main_tar, mode="r", streaming=True) as archive:
+        member = next(iter(archive.tar))
+        with pytest.raises(SecureTarError, match="not supported in streaming mode"):
+            archive.open_tar(member, gzip=False)
+
+
+@pytest.mark.parametrize("enable_gzip", [True, False])
+def test_securetararchive_open_tar_after_close(
+    tmp_path: Path, enable_gzip: bool
+) -> None:
+    """Test a reader used after the archive is closed raises OSError."""
+    inner_tar_file = "core.tar.gz" if enable_gzip else "core.tar"
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path,
+        enable_gzip=enable_gzip,
+        inner_tar_files=(inner_tar_file,),
+        password=None,
+    )
+    archive = SecureTarArchive(main_tar, "r")
+    with archive:
+        member = archive.tar.getmember(inner_tar_file)
+        inner = archive.open_tar(member, gzip=enable_gzip)
+    # tarfile wraps the OSError in ReadError when opening a gzip stream
+    with pytest.raises((OSError, tarfile.ReadError)) as exc_info:
+        with inner as inner_tar:
+            inner_tar.getnames()
+    err: BaseException | None = exc_info.value
+    while err is not None and not isinstance(err, OSError):
+        err = err.__cause__
+    assert isinstance(err, OSError)
+    assert err.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("password", [None, "hunter2"])
+@pytest.mark.parametrize("enable_gzip", [True, False])
+def test_securetararchive_open_tar_reopen_fallback(
+    tmp_path: Path, password: str | None, enable_gzip: bool
+) -> None:
+    """Test the reopen fallback used when os.pread is not available."""
+    inner_tar_file = "core.tar.gz" if enable_gzip else "core.tar"
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path,
+        enable_gzip=enable_gzip,
+        inner_tar_files=(inner_tar_file,),
+        password=password,
+    )
+    with SecureTarArchive(main_tar, "r", password=password) as archive:
+        member = archive.tar.getmember(inner_tar_file)
+        with (
+            patch.object(securetar, "_PreadMemberView") as pread_view,
+            patch(
+                "securetar.hasattr", create=True, side_effect=lambda o, n: n != "pread"
+            ),
+        ):
+            inner = archive.open_tar(member, gzip=enable_gzip)
+        pread_view.assert_not_called()
+        assert isinstance(inner._fileobj.raw, securetar._ReopenMemberView)
+
+        temp_new = tmp_path.joinpath("new")
+        with inner as inner_tar:
+            inner_tar.extractall(
+                path=temp_new, members=inner_tar, filter="fully_trusted"
+            )
+        assert inner._fileobj.closed
+        _assert_extracted_inner_tar(temp_new)
+
+
+def test_securetararchive_open_tar_fileobj_no_fileno(tmp_path: Path) -> None:
+    """Test open_tar with a BytesIO fileobj and no name raises."""
+    main_tar, _ = _create_inner_tar_archive(
+        tmp_path, enable_gzip=False, inner_tar_files=("core.tar",), password=None
+    )
+    fileobj = io.BytesIO(main_tar.read_bytes())
+    with SecureTarArchive(fileobj=fileobj, mode="r") as archive:
+        member = archive.tar.getmember("core.tar")
+        with pytest.raises(SecureTarError, match="has no file descriptor"):
+            archive.open_tar(member, gzip=False)
+
+    # With a name, the reopen fallback is used
+    fileobj = io.BytesIO(main_tar.read_bytes())
+    with SecureTarArchive(main_tar, fileobj=fileobj, mode="r") as archive:
+        member = archive.tar.getmember("core.tar")
+        temp_new = tmp_path.joinpath("new")
+        with archive.open_tar(member, gzip=False) as inner_tar:
+            inner_tar.extractall(path=temp_new, filter="fully_trusted")
+        _assert_extracted_inner_tar(temp_new)
+
+
+def test_member_view_seek() -> None:
+    """Test _MemberView seek semantics."""
+    data = b"0123456789"
+    read, write = os.pipe()
+    os.close(read)
+    os.close(write)
+    with open(os.devnull, "rb") as devnull:
+        view = securetar._PreadMemberView(devnull.fileno(), 0, len(data))
+        assert view.seekable() and view.readable()
+        assert view.seek(3) == 3
+        assert view.tell() == 3
+        assert view.seek(2, io.SEEK_CUR) == 5
+        assert view.seek(-4, io.SEEK_END) == 6
+        assert view.seek(100) == 100
+        assert view.read() == b""
+        with pytest.raises(ValueError, match="Negative seek"):
+            view.seek(-1)
+        with pytest.raises(ValueError, match="Invalid whence"):
+            view.seek(0, 42)
