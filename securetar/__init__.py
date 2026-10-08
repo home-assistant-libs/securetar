@@ -1016,6 +1016,21 @@ class SecureTarFile:
         # Open underlying file or stream
         self._file = self._open_file()
 
+        try:
+            return self._open_encrypted()
+        except BaseException:
+            # Opening the tar in stream mode reads the first block right away,
+            # so header parsing, key derivation or decryption may fail here.
+            # Release the file we opened above and any cipher stream.
+            self.close()
+            raise
+
+    def _open_encrypted(self) -> tarfile.TarFile:
+        """Set up the cipher layer and open the tar on top of it."""
+        if TYPE_CHECKING:
+            assert self._root_key_context is not None
+            assert self._file is not None
+
         # Set up cipher layer
         if self._mode == MOD_READ:
             self._header = SecureTarHeader.from_bytes(self._file)
