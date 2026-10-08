@@ -1568,6 +1568,55 @@ def test_securetararchive_extract_non_regular_inner_tar(tmp_path: Path) -> None:
             secure_tar_archive.extract_tar(tarinfo)
 
 
+@pytest.mark.parametrize("version", [2, 3])
+def test_import_tar_drops_stale_pax_size(tmp_path: Path, version: int) -> None:
+    """Test import_tar does not carry over a PAX size record from the source.
+
+    Members larger than 8 GiB have their size stored in a PAX "size" record
+    when read. TarInfo.tobuf gives that record priority over TarInfo.size, so
+    import_tar must drop it or the encrypted member gets the plaintext size.
+    """
+    password = "hunter2"
+
+    # Build a small plaintext tar; v2 decryption validates the tar magic.
+    inner = io.BytesIO()
+    with tarfile.open(fileobj=inner, mode="w") as inner_tar:
+        inner_tar.addfile(tarfile.TarInfo("empty"))
+    plaintext = inner.getvalue()
+
+    # Create plaintext archive with a member carrying a PAX size record, as
+    # tarfile does for members larger than 8 GiB.
+    plain_tar = tmp_path.joinpath("plain.tar")
+    with tarfile.open(plain_tar, "w", format=tarfile.PAX_FORMAT) as tar:
+        tar_info = tarfile.TarInfo("core.tar")
+        tar_info.size = len(plaintext)
+        tar_info.pax_headers = {"size": str(len(plaintext))}
+        tar.addfile(tar_info, io.BytesIO(plaintext))
+
+    with tarfile.open(plain_tar, "r") as tar:
+        member = tar.getmember("core.tar")
+        assert member.pax_headers == {"size": str(len(plaintext))}
+
+    encrypted_tar = tmp_path.joinpath("encrypted.tar")
+    with (
+        SecureTarArchive(
+            encrypted_tar, "w", create_version=version, password=password
+        ) as encrypted_archive,
+        SecureTarArchive(plain_tar, "r") as plaintext_archive,
+    ):
+        for tar_info in plaintext_archive.tar:
+            encrypted_archive.import_tar(
+                plaintext_archive.tar.extractfile(tar_info), tar_info
+            )
+
+    with SecureTarArchive(encrypted_tar, "r", password=password) as archive:
+        member = archive.tar.getmember("core.tar")
+        assert member.size > len(plaintext)
+        assert "size" not in member.pax_headers
+        with archive.extract_tar(member) as decrypted:
+            assert decrypted.read(len(plaintext) + 1) == plaintext
+
+
 def test_securetararchive_import_tar_before_open() -> None:
     """Test SecureTarArchive.import_tar call before open."""
     tarinfo = tarfile.TarInfo("any.tgz")
