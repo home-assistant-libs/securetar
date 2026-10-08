@@ -1,4 +1,4 @@
 flake8==7.4.1
-black==26.5.1
+black==26.10.0
 mypy==2.4.0
 pytest==9.1.1
