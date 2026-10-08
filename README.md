@@ -65,29 +65,36 @@ Pass `create_version=2` to `SecureTarArchive` to write the legacy AES format.
 
 ## Reading an archive
 
-Iterate the outer tar to find the inner tar files, then use `extract_tar` to
-get a decrypted stream, or wrap a member in `SecureTarFile` to read the inner
-tar directly:
+Iterate the outer tar to find the inner tar files, then use `open_tar` to
+read an inner tar in place, or `extract_tar` to get its decrypted byte
+stream:
 
 ```python
 from pathlib import Path
 
-from securetar import SecureTarArchive, SecureTarFile
+from securetar import SecureTarArchive
 
 with SecureTarArchive(Path("backup.tar"), "r", password="hunter2") as archive:
     for member in archive.tar:
         if not member.name.endswith(".tar.gz"):
             continue
 
-        # Decrypted bytes of the inner tar
+        # Open the inner tar and extract its contents
+        with archive.open_tar(member, gzip=True) as inner_tar:
+            inner_tar.extractall(Path("/restore"), filter="data")
+
+        # Or read the decrypted bytes of the inner tar
         with archive.extract_tar(member) as decrypted:
             data = decrypted.read(1024 * 1024)
-
-        # Or open the inner tar and extract its contents
-        fileobj = archive.tar.extractfile(member)
-        with SecureTarFile(fileobj=fileobj, password="hunter2") as inner_tar:
-            inner_tar.extractall(Path("/restore"), filter="data")
 ```
+
+`open_tar` reads the member without extracting the outer tar first and
+decrypts it when the archive was given a password; without one, the member is
+read as a plain tar. Each reader accesses the archive file independently of
+the archive's own file position, so several inner tars can be read
+concurrently from different threads. The archive must stay open while readers
+are in use. Readers need the archive to be a real file: an archive opened from
+an in-memory file object cannot use `open_tar`.
 
 Encrypted inner tar files are opened in stream mode because the ciphertext is
 not seekable. Random access to members, such as `getmember` followed by
